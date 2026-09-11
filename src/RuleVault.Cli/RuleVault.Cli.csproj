@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>RuleVault.Cli</RootNamespace>
+    <AssemblyName>rv</AssemblyName>
+    <ApplicationIcon />
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RuleVault.Core\RuleVault.Core.csproj" />
+    <ProjectReference Include="..\RuleVault.Storage\RuleVault.Storage.csproj" />
+    <ProjectReference Include="..\RuleVault.Installation\RuleVault.Installation.csproj" />
+    <ProjectReference Include="..\RuleVault.Agents\RuleVault.Agents.csproj" />
+    <PackageReference Include="Spectre.Console" />
+    <PackageReference Include="System.CommandLine" />
+    <PackageReference Include="Microsoft.ML.Tokenizers" />
+    <PackageReference Include="Microsoft.ML.Tokenizers.Data.Cl100kBase" />
+    <PackageReference Include="Microsoft.Bcl.Memory" />
+  </ItemGroup>
+</Project>

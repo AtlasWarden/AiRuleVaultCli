@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RuleVault.Installation\RuleVault.Installation.csproj" />
+    <ProjectReference Include="..\..\src\RuleVault.Agents\RuleVault.Agents.csproj" />
+    <PackageReference Include="xunit.v3" />
+  </ItemGroup>
+</Project>

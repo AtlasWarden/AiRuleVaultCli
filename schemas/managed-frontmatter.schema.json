@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rulevault.local/schema/managed-frontmatter.schema.json",
+  "title": "Managed Rule Vault Markdown frontmatter",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "file_id",
+    "title",
+    "project",
+    "kind",
+    "status",
+    "aliases",
+    "hasInboundLinks",
+    "created"
+  ],
+  "properties": {
+    "file_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "project": {
+      "type": "string",
+      "pattern": "^(global|[a-z0-9]+(?:-[a-z0-9]+)*)$"
+    },
+    "kind": {
+      "enum": [
+        "rule",
+        "context",
+        "index",
+        "reference",
+        "daily"
+      ]
+    },
+    "status": {
+      "enum": [
+        "active",
+        "archived",
+        "retired"
+      ]
+    },
+    "aliases": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "maxLength": 256
+      }
+    },
+    "hasInboundLinks": {
+      "type": "boolean"
+    },
+    "created": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "runtime_canary_id": {
+      "type": "string",
+      "pattern": "^RV-CANARY-[A-Za-z0-9-]{4,128}$"
+    },
+    "extensions": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Za-z][A-Za-z0-9_.-]*:[A-Za-z][A-Za-z0-9_.-]*$"
+      },
+      "additionalProperties": true,
+      "maxProperties": 32
+    }
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rulevault.local/schema/plan.schema.json",
+  "title": "Rule Vault dry-run/apply plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "operation",
+    "target_root",
+    "preconditions",
+    "actions",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "operation": {
+      "enum": [
+        "install",
+        "update",
+        "migrate",
+        "repair",
+        "adapter-update"
+      ]
+    },
+    "target_root": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "preconditions": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1024
+      }
+    },
+    "actions": {
+      "type": "array",
+      "maxItems": 50000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "path",
+          "effect"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "create",
+              "update",
+              "move",
+              "preserve",
+              "decision",
+              "verify"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "effect": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          }
+        }
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}

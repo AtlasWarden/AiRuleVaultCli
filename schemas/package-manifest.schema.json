@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rulevault.local/schema/package-manifest.schema.json",
+  "title": "Rule Vault install package manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "product",
+    "version",
+    "cli_artifact",
+    "runtime_payload",
+    "schemas",
+    "files"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "product": {
+      "const": "rule-vault"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "cli_artifact": {
+      "$ref": "#/$defs/artifact"
+    },
+    "runtime_payload": {
+      "$ref": "#/$defs/artifact"
+    },
+    "schemas": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/artifact"
+      }
+    },
+    "files": {
+      "type": "array",
+      "maxItems": 50000,
+      "items": {
+        "$ref": "#/$defs/artifact"
+      }
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "hash_type"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9A-Fa-f]{64}$"
+        },
+        "hash_type": {
+          "enum": [
+            "raw-bytes",
+            "canonical-text"
+          ]
+        }
+      }
+    }
+  }
+}

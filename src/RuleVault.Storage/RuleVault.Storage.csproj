@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>RuleVault.Storage</RootNamespace>
+    <AssemblyName>RuleVault.Storage</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RuleVault.Core\RuleVault.Core.csproj" />
+    <PackageReference Include="YamlDotNet" />
+  </ItemGroup>
+</Project>

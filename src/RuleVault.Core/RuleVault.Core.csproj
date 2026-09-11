@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>RuleVault.Core</RootNamespace>
+    <AssemblyName>RuleVault.Core</AssemblyName>
+  </PropertyGroup>
+</Project>

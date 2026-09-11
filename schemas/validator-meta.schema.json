@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rulevault.local/schema/validator-meta.schema.json",
+  "title": "Validator metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "automation_consent",
+    "consent_recorded_at",
+    "validation_spec_sha256",
+    "validator"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "automation_consent": {
+      "enum": [
+        "undecided",
+        "approved",
+        "declined"
+      ]
+    },
+    "consent_recorded_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 128
+    },
+    "validation_spec_sha256": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{64}$"
+    },
+    "validator": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "spec_sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9A-Fa-f]{64}$"
+        },
+        "spec_sha256": {
+          "type": "string",
+          "pattern": "^[0-9A-Fa-f]{64}$"
+        }
+      }
+    }
+  }
+}

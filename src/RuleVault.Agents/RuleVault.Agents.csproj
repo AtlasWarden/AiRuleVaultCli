@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>RuleVault.Agents</RootNamespace>
+    <AssemblyName>RuleVault.Agents</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RuleVault.Core\RuleVault.Core.csproj" />
+    <ProjectReference Include="..\RuleVault.Storage\RuleVault.Storage.csproj" />
+  </ItemGroup>
+</Project>

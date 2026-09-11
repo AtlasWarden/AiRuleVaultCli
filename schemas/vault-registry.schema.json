@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rulevault.local/schema/vault-registry.schema.json",
+  "title": "Rule Vault registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "default_vault_root",
+    "vaults"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "default_vault_root": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "vaults": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/vault"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{64}$"
+    },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "vault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vault_root",
+        "vault_id",
+        "applied_guide_sha256",
+        "validation_spec_sha256",
+        "protected_content_manifest_sha256",
+        "created_at",
+        "last_verified_at"
+      ],
+      "properties": {
+        "vault_root": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "vault_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "applied_guide_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "validation_spec_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "protected_content_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "last_verified_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    }
+  }
+}

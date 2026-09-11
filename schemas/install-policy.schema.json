@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rulevault.local/schema/install-policy.schema.json",
+  "title": "Rule Vault installation provenance policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "guide_provenance_mode",
+    "canonical_source",
+    "approved_branch_or_ref"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "guide_provenance_mode": {
+      "enum": [
+        "user-approved",
+        "canonical-git"
+      ]
+    },
+    "canonical_source": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 4096
+    },
+    "approved_branch_or_ref": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 1024
+    }
+  }
+}

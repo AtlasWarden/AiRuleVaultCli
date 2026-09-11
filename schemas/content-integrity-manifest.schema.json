@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rulevault.local/schema/content-integrity-manifest.schema.json",
+  "title": "Protected content integrity manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "vault_id", "revision", "updated_at", "files"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "vault_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "updated_at": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "files": { "type": "array", "maxItems": 50000, "items": { "$ref": "#/$defs/file" } }
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file_id", "path", "sha256", "revision", "change_origin", "changed_at"],
+      "properties": {
+        "file_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+        "path": { "type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)(?!.*//).+$", "maxLength": 4096 },
+        "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "change_origin": { "enum": ["installation", "user-direct", "agent-authorized", "migration"] },
+        "changed_at": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    }
+  }
+}

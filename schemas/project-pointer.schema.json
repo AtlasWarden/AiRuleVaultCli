@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rulevault.local/schema/project-pointer.schema.json",
+  "title": "Private Rule Vault project pointer",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project_id",
+    "name",
+    "storage_mode",
+    "git_state",
+    "last_known_path",
+    "repo_identity"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "project_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "storage_mode": {
+      "enum": [
+        "local-private",
+        "git-backed"
+      ]
+    },
+    "git_state": {
+      "enum": [
+        "none",
+        "initialized",
+        "committed-local",
+        "shared"
+      ]
+    },
+    "last_known_path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 4096
+    },
+    "repo_identity": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 1024
+    }
+  }
+}
