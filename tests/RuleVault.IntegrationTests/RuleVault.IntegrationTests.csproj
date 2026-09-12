@@ -7,6 +7,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\RuleVault.Installation\RuleVault.Installation.csproj" />
     <ProjectReference Include="..\..\src\RuleVault.Agents\RuleVault.Agents.csproj" />
+    <ProjectReference Include="..\..\src\RuleVault.Cli\RuleVault.Cli.csproj" />
     <PackageReference Include="xunit.v3" />
+    <PackageReference Include="Microsoft.ML.Tokenizers.Data.Cl100kBase" />
   </ItemGroup>
 </Project>

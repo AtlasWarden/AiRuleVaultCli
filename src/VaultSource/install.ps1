@@ -19,9 +19,11 @@ $script:ChangesApproved = $false
 $script:IntegrityRepairOutcome = 'not-attempted'
 
 function Write-InstallerHeader([string] $Status = '', [int] $Percent = 0) {
-    Clear-Host
-    if ($Host.Name -eq 'ConsoleHost') {
-        $Host.UI.RawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, 0)
+    if (-not $NonInteractive) {
+        Clear-Host
+        if ($Host.Name -eq 'ConsoleHost') {
+            $Host.UI.RawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, 0)
+        }
     }
     
     Write-Host "====================================================" -ForegroundColor Magenta
@@ -169,6 +171,35 @@ function Confirm-InstalledVaultReady([string] $CliPath, [string] $PackageRoot, [
     }
 
     throw 'The updated vault could not be made ready for agent use.'
+}
+
+function Confirm-AgentContextReady([string] $CliPath, [string] $ConfigRoot) {
+    $sessionId = 'installer-check-' + [guid]::NewGuid().ToString('N')
+    $registered = $false
+    try {
+        Update-InstallerProgress 97 'Checking that agents can load the vault'
+        $registrationResult = & $CliPath agent register --config-root $ConfigRoot --session-id $sessionId --name 'Rule Vault installer check' --folder ([IO.Path]::GetTempPath()) --project global --agent-kind installer --format json
+        $registrationExitCode = $LASTEXITCODE
+        $registration = $null
+        try { $registration = $registrationResult | Out-String | ConvertFrom-Json } catch { }
+        if ($registrationExitCode -ne 0 -or -not $registration -or $registration.code -ne 'OK') {
+            throw 'The installed CLI could not register an agent verification session. Success was not reported.'
+        }
+        $registered = $true
+
+        $contextResult = & $CliPath agent context --config-root $ConfigRoot --session-id $sessionId --operation maintain-vault --subjects 'rules,project' --paths 'AGENTS.md' --format json
+        $contextExitCode = $LASTEXITCODE
+        $context = $null
+        try { $context = $contextResult | Out-String | ConvertFrom-Json } catch { }
+        if ($contextExitCode -ne 0 -or -not $context -or $context.code -ne 'OK') {
+            $reason = if ($context -and $context.code) { $context.code } else { 'unknown error' }
+            throw "The installed vault could not load required agent context ($reason). Success was not reported."
+        }
+    } finally {
+        if ($registered) {
+            & $CliPath agent clear --config-root $ConfigRoot --session-id $sessionId --format json | Out-Null
+        }
+    }
 }
 
 function Read-Choice([string] $Prompt, [string[]] $Allowed, [string] $Default = '') {
@@ -584,13 +615,17 @@ if ((($applyResult | Out-String | ConvertFrom-Json).code) -eq 'OK') {
         Write-Host '  Rerun this installer after resolving the filesystem issue; your vault files were preserved.' -ForegroundColor Gray
         throw
     }
+    Confirm-AgentContextReady $cliInstall.CliPath $configRootFull
     if ($BootstrapAll) {
         Update-InstallerProgress 100 'Adding selected agent bootstraps'
         Invoke-RuleVaultBootstrap $cliInstall.CliPath $configRootFull '' $true $BootstrapHomeRoot | Out-Null
     } elseif (-not [string]::IsNullOrWhiteSpace($BootstrapAdapter)) {
         Update-InstallerProgress 100 'Adding the selected agent bootstrap'
         Invoke-RuleVaultBootstrap $cliInstall.CliPath $configRootFull $BootstrapAdapter $false $BootstrapHomeRoot | Out-Null
-    } elseif (-not $NonInteractive) { Show-RuleVaultBootstrapMenu $cliInstall.CliPath $configRootFull $BootstrapHomeRoot }
+    } elseif (-not $NonInteractive) {
+        Update-InstallerProgress 100 'Adding safe agent bootstraps'
+        Invoke-RuleVaultBootstrap $cliInstall.CliPath $configRootFull '' $true $BootstrapHomeRoot | Out-Null
+    }
     
     Complete-InstallerProgress
     if (-not $NonInteractive) { Clear-Host; Write-InstallerHeader }

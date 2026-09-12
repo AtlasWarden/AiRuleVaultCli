@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -23,6 +24,7 @@ public sealed record RepositoryAgentsInitializeResult(string ProjectId, string P
 
 public static class RepositoryAgentsAuthoring
 {
+    private const string RepositoryWriterTarget = "__rule-vault-repository-agents-transaction__";
     private static readonly JsonSerializerOptions IndentedJson = new() { WriteIndented = true };
     public static async Task<RepositoryAgentsWriteResult> WriteAsync(RepositoryAgentsWriteRequest request, CancellationToken cancellationToken = default)
     {
@@ -60,6 +62,11 @@ public static class RepositoryAgentsAuthoring
     {
         ValidateReadPath(relativePath);
         var root = await VerifyRepositoryRootAsync(repositoryRoot, cancellationToken);
+        return await ReadStableAsync(root, relativePath, cancellationToken);
+    }
+
+    private static async Task<RepositoryAgentsReadResult> ReadCoreAsync(string root, string relativePath, CancellationToken cancellationToken)
+    {
         await VerifyGateAsync(root, relativePath, cancellationToken);
         var bytes = await TrustedFileSystem.ReadAllBytesAsync(root, relativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
         var content = CanonicalHash.DecodeUtf8(bytes);
@@ -165,11 +172,26 @@ public static class RepositoryAgentsAuthoring
 
         var stateRoot = Path.Combine(gitDirectory, "rule-vault-locks");
         var locks = new List<ProtectedLock>();
+        await using var repositoryTransaction = await ProtectedLock.AcquireAsync(
+            stateRoot,
+            RepositoryWriterTarget,
+            waitTimeout: VaultIntegrityTransaction.WriterWaitTimeout,
+            cancellationToken: cancellationToken);
         try
         {
             foreach (var path in files.Keys.OrderBy(value => value, StringComparer.Ordinal))
             {
-                locks.Add(await ProtectedLock.AcquireAsync(stateRoot, path, cancellationToken: cancellationToken));
+                locks.Add(await ProtectedLock.AcquireAsync(stateRoot, path, waitTimeout: VaultIntegrityTransaction.WriterWaitTimeout, cancellationToken: cancellationToken));
+            }
+
+            foreach (var path in files.Keys)
+            {
+                var target = SafePath.ValidateRelative(root, path, SafePathProfile.PrivateConfig);
+                TrustedFileSystem.EnsureSupported(target);
+                if (File.Exists(target.FullPath!))
+                {
+                    throw new VaultAuthoringException("REPOSITORY_AGENTS_EXISTS", "Repository .agents initialization will not overwrite an existing managed file. Read and update the existing project through normal commands.");
+                }
             }
 
             var journal = new TransactionJournal(
@@ -496,13 +518,20 @@ public static class RepositoryAgentsAuthoring
         var stateRoot = Path.Combine(gitDirectory, "rule-vault-locks");
         var lockTargets = new[] { request.RelativePath, ".agents/content-integrity.json" }.OrderBy(value => value, StringComparer.Ordinal).ToArray();
         var locks = new List<ProtectedLock>();
+        await using var repositoryTransaction = await ProtectedLock.AcquireAsync(
+            stateRoot,
+            RepositoryWriterTarget,
+            waitTimeout: VaultIntegrityTransaction.WriterWaitTimeout,
+            cancellationToken: cancellationToken);
         try
         {
             foreach (var lockTarget in lockTargets)
             {
-                locks.Add(await ProtectedLock.AcquireAsync(stateRoot, lockTarget, cancellationToken: cancellationToken));
+                locks.Add(await ProtectedLock.AcquireAsync(stateRoot, lockTarget, waitTimeout: VaultIntegrityTransaction.WriterWaitTimeout, cancellationToken: cancellationToken));
             }
 
+            await VerifyExpectedRawAsync(root, request.RelativePath, request.ExpectedRawSha256, cancellationToken);
+            await VerifyExpectedRawAsync(root, ".agents/content-integrity.json", manifest.RawSha256, cancellationToken);
             var journal = new TransactionJournal(1, Guid.NewGuid().ToString("D"), locks[0].WriterId, TransactionState.Prepared, DateTimeOffset.UtcNow,
                 [new TransactionTarget(request.RelativePath, request.ExpectedRawSha256 ?? "MISSING", CanonicalHash.Raw(Encoding.UTF8.GetBytes(request.Content))), new TransactionTarget(".agents/content-integrity.json", manifest.RawSha256, CanonicalHash.Raw(Encoding.UTF8.GetBytes(manifest.Content)))]);
             await JournalStore.WriteAsync(stateRoot, journal, cancellationToken);
@@ -518,6 +547,97 @@ public static class RepositoryAgentsAuthoring
                 await item.DisposeAsync();
             }
         }
+    }
+
+    private static async Task VerifyExpectedRawAsync(string root, string relativePath, string? expectedRawSha256, CancellationToken cancellationToken)
+    {
+        var target = SafePath.ValidateRelative(root, relativePath, SafePathProfile.PrivateConfig);
+        TrustedFileSystem.EnsureSupported(target);
+        var exists = File.Exists(target.FullPath!);
+        if (!exists)
+        {
+            if (expectedRawSha256 is not null)
+            {
+                throw new WriteConflictException($"Write precondition failed for '{relativePath}'.");
+            }
+            return;
+        }
+
+        if (expectedRawSha256 is null)
+        {
+            throw new WriteConflictException($"Write precondition failed for '{relativePath}'.");
+        }
+        var bytes = await TrustedFileSystem.ReadAllBytesAsync(root, relativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+        if (!string.Equals(CanonicalHash.Raw(bytes), expectedRawSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new WriteConflictException($"Write precondition failed for '{relativePath}'.");
+        }
+    }
+
+    private static async Task<RepositoryAgentsReadResult> ReadStableAsync(string root, string relativePath, CancellationToken cancellationToken)
+    {
+        var stateRoot = RepositoryStateRoot(root);
+        var started = DateTimeOffset.UtcNow;
+        while (true)
+        {
+            while (ProtectedLock.IsHeld(stateRoot, RepositoryWriterTarget))
+            {
+                if (DateTimeOffset.UtcNow - started >= VaultIntegrityTransaction.ReaderWaitTimeout)
+                {
+                    throw new WriteConflictException("A protected repository .agents update is still in progress. Retry after that update completes.");
+                }
+                await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(5, 21)), cancellationToken);
+            }
+
+            var before = await RepositoryManifestHashAsync(root, cancellationToken);
+            RepositoryAgentsReadResult? result = null;
+            Exception? failure = null;
+            try
+            {
+                result = await ReadCoreAsync(root, relativePath, cancellationToken);
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+
+            var after = await RepositoryManifestHashAsync(root, cancellationToken);
+            var changed = !string.Equals(before, after, StringComparison.OrdinalIgnoreCase) || ProtectedLock.IsHeld(stateRoot, RepositoryWriterTarget);
+            if (changed && DateTimeOffset.UtcNow - started < VaultIntegrityTransaction.ReaderWaitTimeout)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(5, 21)), cancellationToken);
+                continue;
+            }
+            if (changed)
+            {
+                throw new WriteConflictException("A protected repository .agents update did not produce a stable readable snapshot. Retry after the update completes.");
+            }
+            if (failure is not null)
+            {
+                ExceptionDispatchInfo.Capture(failure).Throw();
+            }
+            return result!;
+        }
+    }
+
+    private static async Task<string?> RepositoryManifestHashAsync(string root, CancellationToken cancellationToken)
+    {
+        const string manifestPath = ".agents/content-integrity.json";
+        var target = SafePath.ValidateRelative(root, manifestPath, SafePathProfile.PrivateConfig);
+        TrustedFileSystem.EnsureSupported(target);
+        return File.Exists(target.FullPath!)
+            ? CanonicalHash.Raw(await TrustedFileSystem.ReadAllBytesAsync(root, manifestPath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken))
+            : null;
+    }
+
+    private static string RepositoryStateRoot(string root)
+    {
+        var gitDirectory = Path.Combine(root, ".git");
+        if (!Directory.Exists(gitDirectory) || File.GetAttributes(gitDirectory).HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new VaultAuthoringException("REPOSITORY_LOCKS_UNSUPPORTED", "The repository has no safe local .git directory for repository transaction state.");
+        }
+        return Path.Combine(gitDirectory, "rule-vault-locks");
     }
 
     private static async Task<string> RunGitAsync(string root, string arguments, CancellationToken cancellationToken)

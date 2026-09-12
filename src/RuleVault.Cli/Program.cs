@@ -142,6 +142,11 @@ internal sealed class CliInvocation
             return Write(command, "ok", "OK", "Machine-readable opaque agent contract.", AgentCapabilityContract(), 0, json);
         }
 
+        if (command == "agent doctor")
+        {
+            return await DiagnoseAgentViewAsync(json);
+        }
+
         if (command == "capabilities")
         {
             return Write(command, "ok", "OK", "Machine-readable Rule Vault authoring contract.", CapabilityContract(), 0, json);
@@ -663,6 +668,30 @@ internal sealed class CliInvocation
         catch (AgentSessionException exception) { return Write("agent register", "blocked", exception.Code, exception.Message, null, 4, json); }
     }
 
+    private async Task<int> DiagnoseAgentViewAsync(bool json)
+    {
+        try
+        {
+            var result = await AgentSessions.DiagnoseViewAsync(AgentSessions.ResolveConfigRoot(Option("config-root")));
+            var (status, code, message, exitCode) = result.Status switch
+            {
+                "current" => ("ok", "OK", "This command host sees a current, stable Rule Vault registry and manifest.", 0),
+                "likely-stale-registry-view" => ("blocked", "VAULT_REGISTRY_VIEW_STALE", "This command host likely sees an older registry than the current protected-content manifest. Refresh or restart the host, then rerun this command.", 5),
+                "update-in-progress" => ("blocked", "VAULT_UPDATE_IN_PROGRESS", "The observed files changed during diagnosis or a protected update is active. Wait briefly and retry.", 5),
+                _ => ("blocked", "VAULT_REGISTRY_INTEGRITY_MISMATCH", "The command host repeatedly observed a stable registry/manifest mismatch. Use the verified installer repair flow.", 4)
+            };
+            return Write("agent doctor", status, code, message, result, exitCode, json);
+        }
+        catch (AgentSessionException exception)
+        {
+            return Write("agent doctor", "blocked", exception.Code, exception.Message, null, 4, json);
+        }
+        catch (Exception exception) when (exception is SafePathException or StorageFormatException or FileNotFoundException or UnauthorizedAccessException or IOException)
+        {
+            return Write("agent doctor", "blocked", "AGENT_VIEW_DIAGNOSTIC_FAILED", exception.Message, null, 4, json);
+        }
+    }
+
     private async Task<int> BuildAgentContextAsync(bool json)
     {
         var session = Option("session-id");
@@ -688,6 +717,28 @@ internal sealed class CliInvocation
             return Write("agent context", "ok", "OK", result.Delivery == "unchanged"
                 ? "Context revalidated and unchanged. Continue using the retained packet; its body is omitted."
                 : "Loaded every applicable mandatory rule and the task-scoped optional context. Agent startup is complete for this session.", result, 0, json);
+        }
+        catch (AgentSessionException exception) when (exception.Code == "VAULT_REGISTRY_INTEGRITY_MISMATCH")
+        {
+            try
+            {
+                var diagnosis = await AgentSessions.DiagnoseViewAsync(AgentSessions.ResolveConfigRoot(Option("config-root")));
+                var code = diagnosis.Status switch
+                {
+                    "current" => "VAULT_VIEW_REFRESHED_RETRY",
+                    "likely-stale-registry-view" => "VAULT_REGISTRY_VIEW_STALE",
+                    "update-in-progress" => "VAULT_UPDATE_IN_PROGRESS",
+                    _ => exception.Code
+                };
+                var summary = diagnosis.Status == "current"
+                    ? "The command host now sees a current view. Retry agent context."
+                    : exception.Message;
+                return Write("agent context", "blocked", code, summary, diagnosis, 5, json);
+            }
+            catch (Exception diagnosticException) when (diagnosticException is AgentSessionException or SafePathException or StorageFormatException or IOException)
+            {
+                return Write("agent context", "blocked", exception.Code, exception.Message, new { diagnostic_error = diagnosticException.Message }, 4, json);
+            }
         }
         catch (AgentSessionException exception) { return Write("agent context", "blocked", exception.Code, exception.Message, null, 4, json); }
         catch (ContextCatalogException exception) { return Write("agent context", "blocked", exception.Code, exception.Message, null, 4, json); }
@@ -1039,7 +1090,7 @@ internal sealed class CliInvocation
     private int WriteHelp(bool json)
     {
         var text = "Rule Vault CLI\n\n" +
-            "Agent workflow: agent capabilities, agent register, required agent context startup, agent read/write, agent repository read/write, agent project create, agent daily inspect/rollover, agent links/delete, and agent status/clear. Agent commands resolve the selected vault internally and never disclose its location.\n\n" +
+            "Agent workflow: agent capabilities, agent doctor, agent register, required agent context startup, agent read/write, agent repository read/write, agent project create, agent daily inspect/rollover, agent links/delete, and agent status/clear. Agent commands resolve the selected vault internally and never disclose its location.\n\n" +
             "Administrative workflow: capabilities, version, status, doctor, vault inspect/read/write/links/delete, project create, daily inspect/rollover, context, agents discover/write, agents bootstrap discover/apply, install plan, update plan, repair plan, plan show, plan apply.\n" +
             "Use --format text, json, or table. Use --output-file <path> to export the selected representation. Agent reads return a new opaque basis hash; stale sessions must refresh before writing.";
         return Write("help", "ok", "OK", text, null, 0, json);
@@ -1408,6 +1459,7 @@ internal sealed class CliInvocation
         operations = new object[]
         {
             new { name = "agent register", purpose = "Register an opaque agent session with its friendly name, thread/session identity, folder context, and project.", safety = "selected vault resolves internally; stale sessions expire after three days" },
+            new { name = "agent doctor", purpose = "Diagnose whether this command host sees a current registry, an update in progress, a likely stale host view, or a stable integrity mismatch.", safety = "read-only; returns comparable non-secret fingerprints and refresh steps without disclosing the vault location or bypassing integrity" },
             new { name = "agent read", purpose = "Read one managed file with --path or one verified set with --paths and receive a new opaque freshness basis hash.", safety = "verifies requested protected files; blocks dependent work when previously read content changed; never returns the vault location" },
             new { name = "agent write", purpose = "Commit a mediated managed Markdown write for a registered, current session.", safety = "raw-hash precondition; stale-basis block; affected reader sessions are invalidated" },
             new { name = "agent repository read/write/initialize", purpose = "Use the registered workspace folder to initialize or access current-branch .agents Markdown/metadata without disclosing the private vault.", safety = "Git object and no-follow path gate on every access; strict parse plus applicable schema validation before verified authority; protected shared files are paired with their branch manifest" },
@@ -1450,6 +1502,7 @@ internal sealed class CliInvocation
         operations = new object[]
         {
             new { name = "agent context", purpose = "Compile and return the complete deterministic task packet for the registered project, operation, subjects, and paths.", freshness = "Completes mandatory startup, tracks every returned source file, and returns the new opaque basis hash." },
+            new { name = "agent doctor", purpose = "Compare three freshly opened registry/manifest observations and classify stale command-host views.", freshness = "Can run before registration or when context is blocked; compare view_fingerprint with a normal terminal and follow recommended_actions." },
             new { name = "agent read", purpose = "Read one vault-relative managed Markdown file with --path or an atomic requested set with comma-separated --paths; includes protected .vault-system Markdown needed for validation.", freshness = "Every request returns a basis over the session's current read set; a changed earlier read blocks dependent operations until refreshed." },
             new { name = "agent write", purpose = "Create or update managed Markdown through the selected vault's mediated writer.", freshness = "Requires a current session basis and raw precondition; affected sessions become stale." },
             new { name = "agent project create", purpose = "Create missing private project structure without exposing the vault root.", freshness = "Requires a current session basis; invalidates readers of changed paths." },

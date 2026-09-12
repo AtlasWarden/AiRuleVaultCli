@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Runtime.ExceptionServices;
 using RuleVault.Agents;
 using RuleVault.Core;
 using RuleVault.Storage;
@@ -24,6 +25,9 @@ internal static class VaultInspector
     private sealed record InspectionSnapshot(VaultInspection Inspection, IReadOnlyDictionary<string, VerifiedVaultFile> VerifiedContent);
 
     public static async Task<VaultIdentityInspection> InspectIdentityAsync(string vaultRoot, CancellationToken cancellationToken = default)
+        => await ReadStableAsync(vaultRoot, token => InspectIdentityCoreAsync(vaultRoot, token), cancellationToken);
+
+    private static async Task<VaultIdentityInspection> InspectIdentityCoreAsync(string vaultRoot, CancellationToken cancellationToken)
     {
         var metadataBytes = await TrustedFileSystem.ReadAllBytesAsync(vaultRoot, ".vault-system/vault.json", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
         var integrityBytes = await TrustedFileSystem.ReadAllBytesAsync(vaultRoot, ".vault-system/content-integrity.json", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
@@ -31,9 +35,9 @@ internal static class VaultInspector
     }
 
     public static async Task<VaultInspection> InspectAsync(string vaultRoot, CancellationToken cancellationToken = default) =>
-        (await InspectSnapshotAsync(vaultRoot, cancellationToken)).Inspection;
+        (await ReadStableAsync(vaultRoot, token => InspectSnapshotCoreAsync(vaultRoot, token), cancellationToken)).Inspection;
 
-    private static async Task<InspectionSnapshot> InspectSnapshotAsync(string vaultRoot, CancellationToken cancellationToken)
+    private static async Task<InspectionSnapshot> InspectSnapshotCoreAsync(string vaultRoot, CancellationToken cancellationToken)
     {
         var metadataBytes = await TrustedFileSystem.ReadAllBytesAsync(vaultRoot, ".vault-system/vault.json", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
         var integrityBytes = await TrustedFileSystem.ReadAllBytesAsync(vaultRoot, ".vault-system/content-integrity.json", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
@@ -101,8 +105,11 @@ internal static class VaultInspector
     }
 
     public static async Task<VaultTaskContext> BuildTaskPacketAsync(string vaultRoot, TaskDescriptor descriptor, int? maxTotalChars = null, CancellationToken cancellationToken = default)
+        => await ReadStableAsync(vaultRoot, token => BuildTaskPacketCoreAsync(vaultRoot, descriptor, maxTotalChars, token), cancellationToken);
+
+    private static async Task<VaultTaskContext> BuildTaskPacketCoreAsync(string vaultRoot, TaskDescriptor descriptor, int? maxTotalChars, CancellationToken cancellationToken)
     {
-        var snapshot = await InspectSnapshotAsync(vaultRoot, cancellationToken);
+        var snapshot = await InspectSnapshotCoreAsync(vaultRoot, cancellationToken);
         if (!snapshot.VerifiedContent.TryGetValue(".vault-system/routes.json", out var routeCatalog))
         {
             throw new ContextCatalogException("ROUTE_CATALOG_UNVERIFIED", "The route catalog is not integrity-protected. Update or repair the vault before starting an agent session.");
@@ -135,6 +142,76 @@ internal static class VaultInspector
         var selected = result.Packet.Segments.Select(segment => segment.RelativePath).ToHashSet(StringComparer.Ordinal);
         var files = contextFiles.Values.Where(file => selected.Contains(file.RelativePath)).OrderBy(file => file.RelativePath, StringComparer.Ordinal).ToArray();
         return new VaultTaskContext(result.Packet, files);
+    }
+
+    private static async Task<T> ReadStableAsync<T>(string vaultRoot, Func<CancellationToken, Task<T>> read, CancellationToken cancellationToken)
+    {
+        var started = DateTimeOffset.UtcNow;
+        while (true)
+        {
+            await VaultIntegrityTransaction.WaitForWriterAsync(vaultRoot, cancellationToken);
+            byte[] before;
+            try
+            {
+                before = await TrustedFileSystem.ReadAllBytesAsync(
+                    vaultRoot,
+                    ".vault-system/content-integrity.json",
+                    SafePathProfile.PrivateConfig,
+                    cancellationToken: cancellationToken);
+            }
+            catch when (VaultIntegrityTransaction.IsWriterActive(vaultRoot) && DateTimeOffset.UtcNow - started < VaultIntegrityTransaction.ReaderWaitTimeout)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(5, 21)), cancellationToken);
+                continue;
+            }
+
+            T? result = default;
+            Exception? failure = null;
+            try
+            {
+                result = await read(cancellationToken);
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+
+            var writerActive = VaultIntegrityTransaction.IsWriterActive(vaultRoot);
+            byte[]? after = null;
+            try
+            {
+                after = await TrustedFileSystem.ReadAllBytesAsync(
+                    vaultRoot,
+                    ".vault-system/content-integrity.json",
+                    SafePathProfile.PrivateConfig,
+                    cancellationToken: cancellationToken);
+            }
+            catch when (writerActive || VaultIntegrityTransaction.IsWriterActive(vaultRoot))
+            {
+                writerActive = true;
+            }
+
+            var changed = after is null ||
+                !string.Equals(CanonicalHash.Raw(before), CanonicalHash.Raw(after), StringComparison.OrdinalIgnoreCase) ||
+                writerActive || VaultIntegrityTransaction.IsWriterActive(vaultRoot);
+            if (changed && DateTimeOffset.UtcNow - started < VaultIntegrityTransaction.ReaderWaitTimeout)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(5, 21)), cancellationToken);
+                continue;
+            }
+
+            if (changed)
+            {
+                throw new WriteConflictException("A protected Rule Vault update did not produce a stable readable snapshot. Retry after the update completes.");
+            }
+
+            if (failure is not null)
+            {
+                ExceptionDispatchInfo.Capture(failure).Throw();
+            }
+
+            return result!;
+        }
     }
 
     private static IReadOnlyList<ContextRoute> ParseRoutes(JsonElement root)

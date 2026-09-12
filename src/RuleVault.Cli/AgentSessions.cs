@@ -30,6 +30,18 @@ public sealed record AgentFileUsage(string RelativePath, long ReadTokens, long W
 public sealed record AgentFileReader(string SessionId, string FriendlyName, int ReadCount, int WriteCount, long ReadTokens, long WriteTokens);
 public sealed record AgentSessionSummary(string SessionId, string FriendlyName, string AgentKind, string FolderContext, string Project, DateTimeOffset LastSeenAtUtc, string Freshness, string StartupStatus, string? BasisHash, int BasisFileCount, long ReadTokens, long WriteTokens);
 public sealed record AgentUsageReport(AgentUsageOverview Overview, IReadOnlyList<AgentSessionSummary> Sessions, IReadOnlyList<AgentFileUsage> Files);
+public sealed record AgentViewDiagnostic(
+    string Status,
+    bool ContextMayProceed,
+    bool WriterActive,
+    bool SamplesConsistent,
+    string ViewFingerprint,
+    string RegistryRawSha256,
+    string RecordedManifestSha256,
+    string ObservedManifestSha256,
+    DateTimeOffset? RegistryVerifiedAtUtc,
+    DateTimeOffset? ManifestUpdatedAtUtc,
+    IReadOnlyList<string> RecommendedActions);
 
 public sealed class AgentSessionException : Exception
 {
@@ -39,7 +51,8 @@ public sealed class AgentSessionException : Exception
 
 public static class AgentSessions
 {
-    private const string StateFile = "agent-sessions.json";
+    private const string SessionDirectory = "agent-sessions";
+    private static readonly TimeSpan SessionLockWait = TimeSpan.FromSeconds(10);
     private static readonly JsonSerializerOptions StateJson = new() { WriteIndented = true };
     internal static int CountOutputTokens(string content) => Tokenizer.CountTokens(content);
     private static readonly TiktokenTokenizer Tokenizer = TiktokenTokenizer.CreateForEncoding("cl100k_base");
@@ -67,21 +80,22 @@ public static class AgentSessions
     public static async Task<AgentRegistrationResult> RegisterAsync(string configRoot, string sessionId, string friendlyName, string folderContext, string project, string? agentKind, CancellationToken cancellationToken = default)
     {
         ValidateIdentity(sessionId, "session id"); ValidateIdentity(friendlyName, "friendly name"); ValidateIdentity(folderContext, "folder context"); ValidateIdentity(project, "project");
+        var normalizedProject = NormalizeProject(project);
         var now = DateTimeOffset.UtcNow;
-        return await MutateAsync(configRoot, state =>
+        return await MutateAsync(configRoot, sessionId, state =>
         {
             state.RemoveExpired(now);
             var session = state.Sessions.SingleOrDefault(item => item.SessionId.Equals(sessionId, StringComparison.Ordinal));
             if (session is null)
             {
-                session = new AgentSessionState { SessionId = sessionId, FriendlyName = friendlyName, FolderContext = folderContext, Project = project, AgentKind = agentKind ?? "unknown", RegisteredAtUtc = now };
+                session = new AgentSessionState { SessionId = sessionId, FriendlyName = friendlyName, FolderContext = folderContext, Project = normalizedProject, AgentKind = agentKind ?? "unknown", RegisteredAtUtc = now };
                 state.Sessions.Add(session);
             }
             else
             {
                 var scopeChanged = !string.Equals(session.FolderContext, folderContext, StringComparison.OrdinalIgnoreCase) ||
-                    !string.Equals(session.Project, project, StringComparison.Ordinal);
-                session.FriendlyName = friendlyName; session.FolderContext = folderContext; session.Project = project; session.AgentKind = agentKind ?? session.AgentKind;
+                    !string.Equals(session.Project, normalizedProject, StringComparison.Ordinal);
+                session.FriendlyName = friendlyName; session.FolderContext = folderContext; session.Project = normalizedProject; session.AgentKind = agentKind ?? session.AgentKind;
                 if (scopeChanged)
                 {
                     session.Files.Clear();
@@ -109,6 +123,79 @@ public static class AgentSessions
         }, cancellationToken);
     }
 
+    public static async Task<AgentViewDiagnostic> DiagnoseViewAsync(string configRoot, CancellationToken cancellationToken = default)
+    {
+        var samples = new List<AgentViewSample>(3);
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            samples.Add(await ReadViewSampleAsync(configRoot, cancellationToken));
+            if (attempt < 2)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(25), cancellationToken);
+            }
+        }
+
+        var latest = samples[^1];
+        var consistent = samples.All(sample =>
+            sample.RegistryRawSha256 == latest.RegistryRawSha256 &&
+            sample.ManifestRawSha256 == latest.ManifestRawSha256 &&
+            sample.RecordedManifestSha256 == latest.RecordedManifestSha256);
+        var anchorMatches = string.Equals(latest.RecordedManifestSha256, latest.ManifestCanonicalSha256, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(latest.RegistryVaultId, latest.ManifestVaultId, StringComparison.OrdinalIgnoreCase);
+        var writerActive = samples.Any(sample => sample.WriterActive);
+        string status;
+        IReadOnlyList<string> actions;
+        if (anchorMatches && !writerActive)
+        {
+            status = "current";
+            actions = ["Retry agent context. The CLI now sees a current, stable registry and manifest view."];
+        }
+        else if (writerActive || !consistent)
+        {
+            status = "update-in-progress";
+            actions = ["Wait a moment and run agent doctor again.", "Do not bypass integrity validation while files are changing."];
+        }
+        else if (latest.ManifestUpdatedAtUtc is not null &&
+            (latest.RegistryVerifiedAtUtc is null || latest.ManifestUpdatedAtUtc > latest.RegistryVerifiedAtUtc))
+        {
+            status = "likely-stale-registry-view";
+            actions = [
+                "Restart or refresh the agent command host, then run agent doctor again.",
+                "Run the same agent doctor command in a normal terminal and compare view_fingerprint values.",
+                "If the normal terminal reports current but this host does not, restart the host rather than repairing the vault."
+            ];
+        }
+        else
+        {
+            status = "integrity-mismatch";
+            actions = [
+                "Run the verified Rule Vault installer from a normal terminal so it can archive and repair or accept the current protected files.",
+                "Run agent doctor again after the installer completes."
+            ];
+        }
+
+        var viewFingerprint = CanonicalHash.Raw(Encoding.UTF8.GetBytes(string.Join("\n", [
+            latest.RegistryRawSha256,
+            latest.ManifestRawSha256,
+            latest.RecordedManifestSha256,
+            latest.ManifestCanonicalSha256,
+            latest.RegistryVaultId,
+            latest.ManifestVaultId
+        ])));
+        return new AgentViewDiagnostic(
+            status,
+            anchorMatches && !writerActive,
+            writerActive,
+            consistent,
+            viewFingerprint,
+            latest.RegistryRawSha256,
+            latest.RecordedManifestSha256,
+            latest.ManifestCanonicalSha256,
+            latest.RegistryVerifiedAtUtc,
+            latest.ManifestUpdatedAtUtc,
+            actions);
+    }
+
     public static async Task<AgentContextResult> BuildContextAsync(
         string configRoot,
         string sessionId,
@@ -124,9 +211,10 @@ public static class AgentSessions
     {
         ValidateIdentity(sessionId, "session id");
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId);
+            await ImportRepositoryProjectIfNeededAsync(selected.VaultRoot, selected.ConfigRoot, session, cancellationToken);
             var descriptor = TaskDescriptor.Create(session.Project, operation, subjects, paths, audience, includeHistory, optionalBudgetChars);
             var context = await VaultInspector.BuildTaskPacketAsync(selected.VaultRoot, descriptor, maxTotalChars, cancellationToken);
             // Only an explicit receipt for retained model context permits omission.
@@ -168,7 +256,7 @@ public static class AgentSessions
     {
         ValidateIdentity(sessionId, "session id");
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId);
             RequireTaskContext(session);
@@ -191,7 +279,7 @@ public static class AgentSessions
         }
 
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId);
             RequireTaskContext(session);
@@ -214,7 +302,7 @@ public static class AgentSessions
     {
         ValidateIdentity(sessionId, "session id");
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId);
             RequireTaskContext(session, writeRequired: true);
@@ -247,7 +335,7 @@ public static class AgentSessions
     {
         ValidateIdentity(sessionId, "session id");
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId);
             RequireTaskContext(session);
@@ -276,7 +364,7 @@ public static class AgentSessions
     {
         ValidateIdentity(sessionId, "session id");
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId);
             RequireTaskContext(session, writeRequired: true);
@@ -308,7 +396,7 @@ public static class AgentSessions
     {
         ValidateIdentity(sessionId, "session id");
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId);
             RequireTaskContext(session, writeRequired: true);
@@ -326,7 +414,7 @@ public static class AgentSessions
     public static async Task<AgentProjectResult> CreateProjectAsync(string configRoot, string sessionId, string slug, string title, string? purpose, string? endGoal, CancellationToken cancellationToken = default)
     {
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId); RequireTaskContext(session, writeRequired: true); RequireAnySubject(session, ["project", "repository", "git"], "project creation"); await RequireFreshAsync(selected.VaultRoot, session, cancellationToken);
             var result = await VaultAuthoring.CreateProjectAsync(new ProjectCreateRequest(selected.VaultRoot, selected.ConfigRoot, slug, title, purpose, endGoal), cancellationToken);
@@ -338,7 +426,7 @@ public static class AgentSessions
     public static async Task<AgentProjectInspection> InspectProjectAsync(string configRoot, string sessionId, string project, CancellationToken cancellationToken = default)
     {
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId);
             RequireTaskContext(session);
@@ -357,7 +445,7 @@ public static class AgentSessions
     public static async Task<AgentDailyResult> InspectDailyAsync(string configRoot, string sessionId, string project, DateOnly date, CancellationToken cancellationToken = default)
     {
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId);
             RequireTaskContext(session);
@@ -374,7 +462,7 @@ public static class AgentSessions
     public static async Task<AgentLinksResult> InspectLinksAsync(string configRoot, string sessionId, string relativePath, CancellationToken cancellationToken = default)
     {
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId);
             RequireTaskContext(session, writeRequired: true);
@@ -390,7 +478,7 @@ public static class AgentSessions
     public static async Task<AgentMutationResult> RolloverDailyAsync(string configRoot, string sessionId, string project, DateOnly date, string expectedRawSha256, bool promotionsComplete, CancellationToken cancellationToken = default)
     {
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId); RequireTaskContext(session, writeRequired: true); RequireAnySubject(session, ["daily", "continuity", "handoff"], "daily rollover"); await RequireFreshAsync(selected.VaultRoot, session, cancellationToken);
             var changed = await VaultAuthoring.RolloverDailyAsync(selected.VaultRoot, selected.ConfigRoot, project, date, expectedRawSha256, promotionsComplete, cancellationToken);
@@ -402,7 +490,7 @@ public static class AgentSessions
     public static async Task<AgentMutationResult> DeleteAsync(string configRoot, string sessionId, string relativePath, string expectedRawSha256, CancellationToken cancellationToken = default)
     {
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-        return await MutateAsync(configRoot, async state =>
+        return await MutateAsync(configRoot, sessionId, async state =>
         {
             var session = state.Require(sessionId); RequireTaskContext(session, writeRequired: true); RequirePrivatePathScope(session, relativePath); await RequireFreshAsync(selected.VaultRoot, session, cancellationToken);
             var changed = await VaultAuthoring.DeleteAsync(selected.VaultRoot, relativePath, expectedRawSha256, cancellationToken);
@@ -411,83 +499,180 @@ public static class AgentSessions
         }, cancellationToken);
     }
 
-    public static async Task<AgentUsageReport> UsageAsync(string configRoot, string? sessionId, CancellationToken cancellationToken = default) =>
-        await MutateAsync(configRoot, async state =>
-        {
-            var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
-            foreach (var session in state.Sessions)
-            {
-                var stale = await FindStalePathsAsync(selected.VaultRoot, session, cancellationToken);
-                session.InvalidatedAtUtc = stale.Count == 0 ? null : session.InvalidatedAtUtc ?? DateTimeOffset.UtcNow;
-            }
-
-            state.RemoveExpired(DateTimeOffset.UtcNow);
-            var selectedSessions = string.IsNullOrWhiteSpace(sessionId) ? state.Sessions : state.Sessions.Where(item => item.SessionId.Equals(sessionId, StringComparison.Ordinal)).ToList();
-            if (!string.IsNullOrWhiteSpace(sessionId) && selectedSessions.Count == 0)
-            {
-                throw new AgentSessionException("AGENT_SESSION_NOT_FOUND", "No registered agent session has that session id.");
-            }
-
-            var summaries = selectedSessions.OrderBy(item => item.FriendlyName, StringComparer.Ordinal).Select(item => new AgentSessionSummary(item.SessionId, item.FriendlyName, item.AgentKind, item.FolderContext, item.Project, item.LastSeenAtUtc, AgentSessionDocument.Freshness(item), item.StartupCompletedAtUtc is null ? "required" : "complete", AgentSessionDocument.BasisHashOrNull(item), AgentSessionDocument.BasisFileCount(item), item.ReadTokens, item.WriteTokens)).ToArray();
-            var files = selectedSessions.SelectMany(session => session.Files.Select(file => new { session, file }))
-                .GroupBy(item => item.file.RelativePath, StringComparer.Ordinal).OrderBy(group => group.Key, StringComparer.Ordinal)
-                .Select(group => new AgentFileUsage(group.Key, group.Sum(item => item.file.ReadTokens), group.Sum(item => item.file.WriteTokens), group.Sum(item => item.file.ReadCount), group.Sum(item => item.file.WriteCount), group.OrderBy(item => item.session.FriendlyName, StringComparer.Ordinal).Select(item => new AgentFileReader(item.session.SessionId, item.session.FriendlyName, item.file.ReadCount, item.file.WriteCount, item.file.ReadTokens, item.file.WriteTokens)).ToArray())).ToArray();
-            return new AgentUsageReport(new AgentUsageOverview(summaries.Length, summaries.Count(item => item.Freshness == "stale"), summaries.Sum(item => item.ReadTokens), summaries.Sum(item => item.WriteTokens), summaries.Sum(item => item.ReadTokens + item.WriteTokens), files.Length), summaries, files);
-        }, cancellationToken);
-
-    public static async Task<int> ClearAsync(string configRoot, string? sessionId, bool all, CancellationToken cancellationToken = default) =>
-        await MutateAsync(configRoot, state =>
-        {
-            if (all) { var count = state.Sessions.Count; state.Sessions.Clear(); return count; }
-            if (string.IsNullOrWhiteSpace(sessionId))
-            {
-                throw new AgentSessionException("AGENT_CLEAR_INPUT_REQUIRED", "Provide --session-id or --all true.");
-            }
-
-            return state.Sessions.RemoveAll(item => item.SessionId.Equals(sessionId, StringComparison.Ordinal));
-        }, cancellationToken);
-
-    private static async Task<SelectedVault> ResolveSelectedVaultAsync(string configRoot, CancellationToken cancellationToken)
+    public static async Task<AgentUsageReport> UsageAsync(string configRoot, string? sessionId, CancellationToken cancellationToken = default)
     {
-        var bytes = await TrustedFileSystem.ReadAllBytesAsync(configRoot, "vault-registry.json", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
-        using var document = StrictJson.Parse(bytes);
-        var root = document.RootElement;
-        if (!root.TryGetProperty("default_vault_root", out var defaultRoot) || defaultRoot.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(defaultRoot.GetString()) ||
-            !root.TryGetProperty("vaults", out var vaults) || vaults.ValueKind != JsonValueKind.Array)
+        var state = await LoadAllAsync(configRoot, cancellationToken);
+        var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
+        await Parallel.ForEachAsync(state.Sessions, cancellationToken, async (session, token) =>
+        {
+            var stale = await FindStalePathsAsync(selected.VaultRoot, session, token);
+            session.InvalidatedAtUtc = stale.Count == 0 ? null : session.InvalidatedAtUtc ?? DateTimeOffset.UtcNow;
+        });
+
+        state.RemoveExpired(DateTimeOffset.UtcNow);
+        var selectedSessions = string.IsNullOrWhiteSpace(sessionId) ? state.Sessions : state.Sessions.Where(item => item.SessionId.Equals(sessionId, StringComparison.Ordinal)).ToList();
+        if (!string.IsNullOrWhiteSpace(sessionId) && selectedSessions.Count == 0)
+        {
+            throw new AgentSessionException("AGENT_SESSION_NOT_FOUND", "No registered agent session has that session id.");
+        }
+
+        var summaries = selectedSessions.OrderBy(item => item.FriendlyName, StringComparer.Ordinal).Select(item => new AgentSessionSummary(item.SessionId, item.FriendlyName, item.AgentKind, item.FolderContext, item.Project, item.LastSeenAtUtc, AgentSessionDocument.Freshness(item), item.StartupCompletedAtUtc is null ? "required" : "complete", AgentSessionDocument.BasisHashOrNull(item), AgentSessionDocument.BasisFileCount(item), item.ReadTokens, item.WriteTokens)).ToArray();
+        var files = selectedSessions.SelectMany(session => session.Files.Select(file => new { session, file }))
+            .GroupBy(item => item.file.RelativePath, StringComparer.Ordinal).OrderBy(group => group.Key, StringComparer.Ordinal)
+            .Select(group => new AgentFileUsage(group.Key, group.Sum(item => item.file.ReadTokens), group.Sum(item => item.file.WriteTokens), group.Sum(item => item.file.ReadCount), group.Sum(item => item.file.WriteCount), group.OrderBy(item => item.session.FriendlyName, StringComparer.Ordinal).Select(item => new AgentFileReader(item.session.SessionId, item.session.FriendlyName, item.file.ReadCount, item.file.WriteCount, item.file.ReadTokens, item.file.WriteTokens)).ToArray())).ToArray();
+        return new AgentUsageReport(new AgentUsageOverview(summaries.Length, summaries.Count(item => item.Freshness == "stale"), summaries.Sum(item => item.ReadTokens), summaries.Sum(item => item.WriteTokens), summaries.Sum(item => item.ReadTokens + item.WriteTokens), files.Length), summaries, files);
+    }
+
+    public static async Task<int> ClearAsync(string configRoot, string? sessionId, bool all, CancellationToken cancellationToken = default)
+    {
+        if (!all && string.IsNullOrWhiteSpace(sessionId))
+        {
+            throw new AgentSessionException("AGENT_CLEAR_INPUT_REQUIRED", "Provide --session-id or --all true.");
+        }
+
+        if (!all)
+        {
+            return await DeleteSessionAsync(configRoot, sessionId!, cancellationToken) ? 1 : 0;
+        }
+
+        var files = EnumerateSessionFiles(configRoot).ToArray();
+        var removed = 0;
+        foreach (var file in files)
+        {
+            var relative = $"{SessionDirectory}/{Path.GetFileName(file)}";
+            await using var writeLock = await ProtectedLock.AcquireAsync(configRoot, relative, waitTimeout: SessionLockWait, cancellationToken: cancellationToken);
+            if (File.Exists(file))
+            {
+                File.Delete(file);
+                removed++;
+            }
+        }
+
+        return removed;
+    }
+
+    private sealed record AgentViewSample(
+        string RegistryRawSha256,
+        string ManifestRawSha256,
+        string RecordedManifestSha256,
+        string ManifestCanonicalSha256,
+        string RegistryVaultId,
+        string ManifestVaultId,
+        DateTimeOffset? RegistryVerifiedAtUtc,
+        DateTimeOffset? ManifestUpdatedAtUtc,
+        bool WriterActive);
+
+    private static async Task<AgentViewSample> ReadViewSampleAsync(string configRoot, CancellationToken cancellationToken)
+    {
+        var registryBytes = await TrustedFileSystem.ReadAllBytesAsync(configRoot, "vault-registry.json", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+        using var registryDocument = StrictJson.Parse(registryBytes);
+        var registryRoot = registryDocument.RootElement;
+        if (!registryRoot.TryGetProperty("default_vault_root", out var defaultRoot) || defaultRoot.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(defaultRoot.GetString()) ||
+            !registryRoot.TryGetProperty("vaults", out var vaults) || vaults.ValueKind != JsonValueKind.Array)
         {
             throw new AgentSessionException("VAULT_REGISTRY_INVALID", "The selected-vault registry is missing required fields.");
         }
 
         var configuredRoot = NormalizeRoot(defaultRoot.GetString()!);
-        var matches = new List<JsonElement>();
-        foreach (var item in vaults.EnumerateArray())
-        {
-            if (item.ValueKind != JsonValueKind.Object || !item.TryGetProperty("vault_root", out var value) || value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(value.GetString()))
-            {
-                throw new AgentSessionException("VAULT_REGISTRY_INVALID", "The selected-vault registry contains an invalid vault entry.");
-            }
-            if (string.Equals(NormalizeRoot(value.GetString()!), configuredRoot, StringComparison.OrdinalIgnoreCase))
-            {
-                matches.Add(item);
-            }
-        }
-        if (matches.Count != 1)
+        var entries = vaults.EnumerateArray().Where(item =>
+            item.ValueKind == JsonValueKind.Object &&
+            item.TryGetProperty("vault_root", out var value) &&
+            value.ValueKind == JsonValueKind.String &&
+            !string.IsNullOrWhiteSpace(value.GetString()) &&
+            string.Equals(NormalizeRoot(value.GetString()!), configuredRoot, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (entries.Length != 1 ||
+            !entries[0].TryGetProperty("vault_id", out var registryId) || registryId.ValueKind != JsonValueKind.String ||
+            !entries[0].TryGetProperty("protected_content_manifest_sha256", out var recordedHash) || recordedHash.ValueKind != JsonValueKind.String)
         {
             throw new AgentSessionException("VAULT_REGISTRY_INVALID", "The selected-vault registry entry is missing or ambiguous.");
         }
-        var entry = matches[0];
-        if (entry.ValueKind != JsonValueKind.Object || !entry.TryGetProperty("vault_id", out var registryId) || registryId.ValueKind != JsonValueKind.String || !entry.TryGetProperty("protected_content_manifest_sha256", out var registryHash) || registryHash.ValueKind != JsonValueKind.String)
+
+        var manifestBytes = await TrustedFileSystem.ReadAllBytesAsync(configuredRoot, ".vault-system/content-integrity.json", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+        using var manifestDocument = StrictJson.Parse(manifestBytes);
+        if (!manifestDocument.RootElement.TryGetProperty("vault_id", out var manifestId) || manifestId.ValueKind != JsonValueKind.String)
         {
-            throw new AgentSessionException("VAULT_REGISTRY_INVALID", "The selected-vault registry entry is incomplete or ambiguous.");
+            throw new AgentSessionException("INTEGRITY_MANIFEST_INVALID", "The protected-content manifest has no vault identity.");
         }
 
-        var inspection = await VaultInspector.InspectIdentityAsync(configuredRoot, cancellationToken);
-        if (!string.Equals(inspection.VaultId, registryId.GetString(), StringComparison.OrdinalIgnoreCase) || !string.Equals(inspection.ContentIntegrityCanonicalSha256, registryHash.GetString(), StringComparison.OrdinalIgnoreCase))
-        {
-            throw new AgentSessionException("VAULT_REGISTRY_INTEGRITY_MISMATCH", "Rule Vault found a mismatch between its saved protected-file fingerprint and the files on disk. Run the verified Rule Vault installer to archive the old state and repair or explicitly accept the current files; do not bypass this check.");
-        }
+        static DateTimeOffset? OptionalTimestamp(JsonElement element, string name) =>
+            element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String &&
+            DateTimeOffset.TryParse(value.GetString(), System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out var parsed)
+                ? parsed.ToUniversalTime()
+                : null;
 
-        return new SelectedVault(configuredRoot, configRoot);
+        var manifestContent = CanonicalHash.DecodeUtf8(manifestBytes, allowBom: false);
+        return new AgentViewSample(
+            CanonicalHash.Raw(registryBytes),
+            CanonicalHash.Raw(manifestBytes),
+            recordedHash.GetString()!,
+            CanonicalHash.Text(manifestContent),
+            registryId.GetString()!,
+            manifestId.GetString()!,
+            OptionalTimestamp(entries[0], "last_verified_at"),
+            OptionalTimestamp(manifestDocument.RootElement, "updated_at"),
+            VaultIntegrityTransaction.IsWriterActive(configuredRoot));
+    }
+
+    private static async Task<SelectedVault> ResolveSelectedVaultAsync(string configRoot, CancellationToken cancellationToken)
+    {
+        var started = DateTimeOffset.UtcNow;
+        while (true)
+        {
+            var bytes = await TrustedFileSystem.ReadAllBytesAsync(configRoot, "vault-registry.json", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+            using var document = StrictJson.Parse(bytes);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("default_vault_root", out var defaultRoot) || defaultRoot.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(defaultRoot.GetString()) ||
+                !root.TryGetProperty("vaults", out var vaults) || vaults.ValueKind != JsonValueKind.Array)
+            {
+                throw new AgentSessionException("VAULT_REGISTRY_INVALID", "The selected-vault registry is missing required fields.");
+            }
+
+            var configuredRoot = NormalizeRoot(defaultRoot.GetString()!);
+            await VaultIntegrityTransaction.WaitForWriterAsync(configuredRoot, cancellationToken);
+            var matches = new List<JsonElement>();
+            foreach (var item in vaults.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object || !item.TryGetProperty("vault_root", out var value) || value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(value.GetString()))
+                {
+                    throw new AgentSessionException("VAULT_REGISTRY_INVALID", "The selected-vault registry contains an invalid vault entry.");
+                }
+                if (string.Equals(NormalizeRoot(value.GetString()!), configuredRoot, StringComparison.OrdinalIgnoreCase))
+                {
+                    matches.Add(item);
+                }
+            }
+            if (matches.Count != 1)
+            {
+                throw new AgentSessionException("VAULT_REGISTRY_INVALID", "The selected-vault registry entry is missing or ambiguous.");
+            }
+            var entry = matches[0];
+            if (entry.ValueKind != JsonValueKind.Object || !entry.TryGetProperty("vault_id", out var registryId) || registryId.ValueKind != JsonValueKind.String || !entry.TryGetProperty("protected_content_manifest_sha256", out var registryHash) || registryHash.ValueKind != JsonValueKind.String)
+            {
+                throw new AgentSessionException("VAULT_REGISTRY_INVALID", "The selected-vault registry entry is incomplete or ambiguous.");
+            }
+
+            var inspection = await VaultInspector.InspectIdentityAsync(configuredRoot, cancellationToken);
+            var after = await TrustedFileSystem.ReadAllBytesAsync(configRoot, "vault-registry.json", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+            var stable = string.Equals(CanonicalHash.Raw(bytes), CanonicalHash.Raw(after), StringComparison.OrdinalIgnoreCase) &&
+                !VaultIntegrityTransaction.IsWriterActive(configuredRoot);
+            if (!stable && DateTimeOffset.UtcNow - started < VaultIntegrityTransaction.ReaderWaitTimeout)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(5, 21)), cancellationToken);
+                continue;
+            }
+
+            if (!stable)
+            {
+                throw new AgentSessionException("VAULT_UPDATE_IN_PROGRESS", "Rule Vault could not obtain a stable registry snapshot while a protected update was in progress. Retry the command.");
+            }
+
+            if (!string.Equals(inspection.VaultId, registryId.GetString(), StringComparison.OrdinalIgnoreCase) || !string.Equals(inspection.ContentIntegrityCanonicalSha256, registryHash.GetString(), StringComparison.OrdinalIgnoreCase))
+            {
+                throw new AgentSessionException("VAULT_REGISTRY_INTEGRITY_MISMATCH", "Rule Vault found a mismatch between its saved protected-file fingerprint and the files on disk. Run 'rv agent doctor --format json' from this command host to distinguish a stale host view from a real mismatch; do not bypass this check.");
+            }
+
+            return new SelectedVault(configuredRoot, configRoot);
+        }
     }
 
     private static string NormalizeRoot(string path)
@@ -497,6 +682,95 @@ public static class AgentSessions
         return string.Equals(fullPath, root, StringComparison.OrdinalIgnoreCase)
             ? fullPath
             : fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    private static string NormalizeProject(string project)
+    {
+        if (string.Equals(project.Trim(), "global", StringComparison.OrdinalIgnoreCase))
+        {
+            return "global";
+        }
+
+        var value = project.Trim().Normalize(NormalizationForm.FormKC);
+        value = System.Text.RegularExpressions.Regex.Replace(value, "([a-z0-9])([A-Z])", "$1-$2", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        value = System.Text.RegularExpressions.Regex.Replace(value.ToLowerInvariant(), "[^a-z0-9]+", "-", System.Text.RegularExpressions.RegexOptions.CultureInvariant).Trim('-');
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new AgentSessionException("PROJECT_SCOPE_INVALID", "Project must contain at least one letter or number.");
+        }
+
+        return value;
+    }
+
+    private static async Task ImportRepositoryProjectIfNeededAsync(string vaultRoot, string configRoot, AgentSessionState session, CancellationToken cancellationToken)
+    {
+        if (session.Project == "global")
+        {
+            return;
+        }
+
+        string repositoryRoot;
+        RepositoryAgentsReadResult repositoryProject;
+        try
+        {
+            repositoryRoot = await RepositoryAgentsAuthoring.ResolveRepositoryRootAsync(session.FolderContext, cancellationToken);
+            repositoryProject = await RepositoryAgentsAuthoring.ReadAsync(repositoryRoot, ".agents/project.json", cancellationToken);
+        }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException or VaultAuthoringException)
+        {
+            return;
+        }
+
+        if (repositoryProject.ContentHandling != "verified-current-branch" || repositoryProject.MetadataStatus != "schema-valid")
+        {
+            return;
+        }
+
+        using var document = StrictJson.Parse(Encoding.UTF8.GetBytes(repositoryProject.Content));
+        var root = document.RootElement;
+        string Required(string name) => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(value.GetString())
+            ? value.GetString()!
+            : throw new AgentSessionException("REPOSITORY_PROJECT_IDENTITY_INVALID", $"Verified .agents/project.json has no valid {name}.");
+        var projectId = Required("project_id");
+        var projectSlug = Required("project_slug");
+        var title = Required("title");
+        if (!Guid.TryParse(projectId, out _) || !string.Equals(projectSlug, session.Project, StringComparison.Ordinal))
+        {
+            throw new AgentSessionException("REPOSITORY_PROJECT_IDENTITY_MISMATCH", "The verified repository project identity does not match the registered project.");
+        }
+
+        var projectIndex = SafePath.ValidateRelative(vaultRoot, $"projects/{projectSlug}/index.md", SafePathProfile.PrivateConfig);
+        TrustedFileSystem.EnsureSupported(projectIndex);
+        if (!File.Exists(projectIndex.FullPath!))
+        {
+            try
+            {
+                await VaultAuthoring.CreateProjectAsync(new ProjectCreateRequest(
+                    vaultRoot,
+                    configRoot,
+                    projectSlug,
+                    title,
+                    null,
+                    null,
+                    projectId,
+                    "git-backed",
+                    "current-branch-verified",
+                    repositoryRoot), cancellationToken);
+                return;
+            }
+            catch (Exception exception) when (exception is WriteConflictException || exception is VaultAuthoringException { Code: "PROJECT_EXISTS" })
+            {
+                // Another context request may have imported this same verified
+                // repository identity while this request was waiting for the
+                // protected-content writer transaction. Validate the winner.
+            }
+        }
+
+        var existing = await VaultAuthoring.InspectProjectAsync(vaultRoot, projectSlug, cancellationToken);
+        if (!string.Equals(existing.ProjectId, projectId, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new AgentSessionException("REPOSITORY_PROJECT_IDENTITY_MISMATCH", "The verified repository and private vault use different project identities.");
+        }
     }
 
     private static async Task<List<string>> FindStalePathsAsync(string? vaultRoot, AgentSessionState session, CancellationToken cancellationToken)
@@ -616,36 +890,45 @@ public static class AgentSessions
         return tokens;
     }
 
-    private static async Task<T> MutateAsync<T>(string configRoot, Func<AgentSessionDocument, T> action, CancellationToken cancellationToken) =>
-        await MutateAsync(configRoot, state => Task.FromResult(action(state)), cancellationToken);
+    private static async Task<T> MutateAsync<T>(string configRoot, string sessionId, Func<AgentSessionDocument, T> action, CancellationToken cancellationToken) =>
+        await MutateAsync(configRoot, sessionId, state => Task.FromResult(action(state)), cancellationToken);
 
-    private static async Task<T> MutateAsync<T>(string configRoot, Func<AgentSessionDocument, Task<T>> action, CancellationToken cancellationToken)
+    private static async Task<T> MutateAsync<T>(string configRoot, string sessionId, Func<AgentSessionDocument, Task<T>> action, CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(configRoot);
-        await using var writeLock = await ProtectedLock.AcquireAsync(configRoot, StateFile, cancellationToken: cancellationToken);
-        var (state, rawHash) = await LoadAsync(configRoot, cancellationToken);
+        var stateFile = SessionFile(sessionId);
+        await using var writeLock = await ProtectedLock.AcquireAsync(configRoot, stateFile, waitTimeout: SessionLockWait, cancellationToken: cancellationToken);
+        var (state, rawHash) = await LoadAsync(configRoot, stateFile, sessionId, cancellationToken);
         state.RemoveExpired(DateTimeOffset.UtcNow);
         var result = await action(state);
         await writeLock.VerifyOwnershipAsync(cancellationToken);
+        if (state.Sessions.Count != 1 || !state.Sessions[0].SessionId.Equals(sessionId, StringComparison.Ordinal))
+        {
+            throw new AgentSessionException("AGENT_SESSION_STATE_INVALID", "A session shard must contain exactly its registered agent session.");
+        }
         state.SchemaVersion = 1; state.UpdatedAtUtc = DateTimeOffset.UtcNow;
         var content = JsonSerializer.Serialize(state, StateJson) + "\n";
-        await TrustedWriter.WriteTextAsync(configRoot, StateFile, content, rawHash, SafePathProfile.PrivateConfig, cancellationToken);
+        await TrustedWriter.WriteTextAsync(configRoot, stateFile, content, rawHash, SafePathProfile.PrivateConfig, cancellationToken);
         return result;
     }
 
-    private static async Task<(AgentSessionDocument State, string? RawHash)> LoadAsync(string configRoot, CancellationToken cancellationToken)
+    private static async Task<(AgentSessionDocument State, string? RawHash)> LoadAsync(string configRoot, string stateFile, string? expectedSessionId, CancellationToken cancellationToken)
     {
-        var path = SafePath.ValidateRelative(configRoot, StateFile, SafePathProfile.PrivateConfig); TrustedFileSystem.EnsureSupported(path);
+        var path = SafePath.ValidateRelative(configRoot, stateFile, SafePathProfile.PrivateConfig); TrustedFileSystem.EnsureSupported(path);
         if (!File.Exists(path.FullPath!))
         {
             return (new AgentSessionDocument(), null);
         }
 
-        var bytes = await TrustedFileSystem.ReadAllBytesAsync(configRoot, StateFile, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+        var bytes = await TrustedFileSystem.ReadAllBytesAsync(configRoot, stateFile, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
         try
         {
             var state = StrictJson.Deserialize<AgentSessionDocument>(bytes);
-            if (state.SchemaVersion != 1 || state.Sessions.Any(session => string.IsNullOrWhiteSpace(session.SessionId) || session.Files is null || session.StartupSubjects is null || session.StartupPaths is null || session.Files.GroupBy(file => file.RelativePath, StringComparer.Ordinal).Any(group => group.Count() != 1)))
+            if (state.SchemaVersion != 1 || state.Sessions.Count > 1 ||
+                state.Sessions.Any(session => string.IsNullOrWhiteSpace(session.SessionId) ||
+                    (expectedSessionId is not null && !session.SessionId.Equals(expectedSessionId, StringComparison.Ordinal)) ||
+                    session.Files is null || session.StartupSubjects is null || session.StartupPaths is null ||
+                    session.Files.GroupBy(file => file.RelativePath, StringComparer.Ordinal).Any(group => group.Count() != 1)))
             {
                 throw new AgentSessionException("AGENT_SESSION_STATE_INVALID", "Agent session state does not match the supported schema.");
             }
@@ -653,6 +936,65 @@ public static class AgentSessions
             return (state, CanonicalHash.Raw(bytes));
         }
         catch (StorageFormatException exception) { throw new AgentSessionException("AGENT_SESSION_STATE_INVALID", exception.Message); }
+    }
+
+    private static string SessionFile(string sessionId) =>
+        $"{SessionDirectory}/{CanonicalHash.Raw(Encoding.UTF8.GetBytes(sessionId)).ToLowerInvariant()}.json";
+
+    private static IEnumerable<string> EnumerateSessionFiles(string configRoot)
+    {
+        var directory = Path.Combine(Path.GetFullPath(configRoot), SessionDirectory);
+        if (!Directory.Exists(directory))
+        {
+            return [];
+        }
+        if (File.GetAttributes(directory).HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new AgentSessionException("AGENT_SESSION_STATE_INVALID", "The agent session directory cannot be a reparse point.");
+        }
+
+        return Directory.EnumerateFiles(directory, "*.json", SearchOption.TopDirectoryOnly)
+            .Where(path => Path.GetFileNameWithoutExtension(path) is { Length: 64 } name && name.All(char.IsAsciiHexDigit))
+            .ToArray();
+    }
+
+    private static async Task<AgentSessionDocument> LoadAllAsync(string configRoot, CancellationToken cancellationToken)
+    {
+        var state = new AgentSessionDocument();
+        foreach (var file in EnumerateSessionFiles(configRoot))
+        {
+            var relative = $"{SessionDirectory}/{Path.GetFileName(file)}";
+            try
+            {
+                var (shard, _) = await LoadAsync(configRoot, relative, null, cancellationToken);
+                if (shard.Sessions.Count == 1 && state.Sessions.All(item => !item.SessionId.Equals(shard.Sessions[0].SessionId, StringComparison.Ordinal)))
+                {
+                    state.Sessions.Add(shard.Sessions[0]);
+                }
+            }
+            catch (FileNotFoundException)
+            {
+                // A concurrent clear may remove a side-information shard between enumeration and read.
+            }
+        }
+
+        return state;
+    }
+
+    private static async Task<bool> DeleteSessionAsync(string configRoot, string sessionId, CancellationToken cancellationToken)
+    {
+        ValidateIdentity(sessionId, "session id");
+        var stateFile = SessionFile(sessionId);
+        await using var writeLock = await ProtectedLock.AcquireAsync(configRoot, stateFile, waitTimeout: SessionLockWait, cancellationToken: cancellationToken);
+        var target = SafePath.ValidateRelative(configRoot, stateFile, SafePathProfile.PrivateConfig);
+        TrustedFileSystem.EnsureSupported(target);
+        if (!File.Exists(target.FullPath!))
+        {
+            return false;
+        }
+
+        File.Delete(target.FullPath!);
+        return true;
     }
 
     private static void ValidateIdentity(string value, string label)

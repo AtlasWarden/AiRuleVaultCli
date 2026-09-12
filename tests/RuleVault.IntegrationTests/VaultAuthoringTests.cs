@@ -2,6 +2,8 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using RuleVault.Agents;
+using RuleVault.Cli;
+using RuleVault.Core;
 using RuleVault.Storage;
 using Xunit;
 
@@ -12,6 +14,189 @@ public sealed class VaultAuthoringTests
     private static readonly JsonSerializerOptions IndentedJson = new() { WriteIndented = true };
     private static readonly string[] AllOperations = ["read", "edit", "test", "review", "release", "maintain-vault"];
     private static readonly string[] RootIndexRequirement = ["root-index"];
+
+    [Fact]
+    public async Task TwoHundredAgentsRegisterAndLoadContextWithoutAGlobalSessionLock()
+    {
+        using var fixture = await Fixture.CreateAsync(TestContext.Current.CancellationToken);
+        var sessionIds = Enumerable.Range(0, 200).Select(index => $"parallel-session-{index:D3}").ToArray();
+
+        var registrations = await Task.WhenAll(sessionIds.Select(sessionId => AgentSessions.RegisterAsync(
+            fixture.Config,
+            sessionId,
+            $"Agent {sessionId}",
+            fixture.Root,
+            "global",
+            "synthetic",
+            TestContext.Current.CancellationToken)));
+        Assert.Equal(200, registrations.Length);
+
+        var contexts = await Task.WhenAll(sessionIds.Select(sessionId => AgentSessions.BuildContextAsync(
+            fixture.Config,
+            sessionId,
+            TaskOperation.Read,
+            ["memory"],
+            [],
+            ContextAudience.Private,
+            false,
+            0,
+            null,
+            cancellationToken: TestContext.Current.CancellationToken)));
+
+        Assert.All(contexts, context => Assert.True(context.StartupComplete));
+        Assert.Equal(200, Directory.EnumerateFiles(Path.Combine(fixture.Config, "agent-sessions"), "*.json", SearchOption.TopDirectoryOnly).Count());
+        Assert.False(File.Exists(Path.Combine(fixture.Config, "agent-sessions.json")));
+    }
+
+    [Fact]
+    public async Task AgentDoctorDistinguishesCurrentStaleViewAndStableMismatchWithoutDisclosingVault()
+    {
+        using var fixture = await Fixture.CreateAsync(TestContext.Current.CancellationToken);
+        var current = await AgentSessions.DiagnoseViewAsync(fixture.Config, TestContext.Current.CancellationToken);
+        Assert.Equal("current", current.Status);
+        Assert.True(current.ContextMayProceed);
+        Assert.DoesNotContain(fixture.Vault, JsonSerializer.Serialize(current), StringComparison.OrdinalIgnoreCase);
+        using var currentCommand = await Cli("agent", "doctor", "--config-root", fixture.Config);
+        Assert.Equal("current", currentCommand.RootElement.GetProperty("data").GetProperty("status").GetString());
+        using var registration = await Cli("agent", "register", "--config-root", fixture.Config, "--session-id", "doctor-session", "--name", "Doctor Agent", "--folder", fixture.Root, "--project", "global");
+
+        var registryPath = Path.Combine(fixture.Config, "vault-registry.json");
+        var registry = JsonNode.Parse(await File.ReadAllTextAsync(registryPath, TestContext.Current.CancellationToken))!.AsObject();
+        registry["vaults"]![0]!["protected_content_manifest_sha256"] = new string('0', 64);
+        await File.WriteAllTextAsync(registryPath, registry.ToJsonString(IndentedJson) + "\n", TestContext.Current.CancellationToken);
+        var stale = await AgentSessions.DiagnoseViewAsync(fixture.Config, TestContext.Current.CancellationToken);
+        Assert.Equal("likely-stale-registry-view", stale.Status);
+        Assert.False(stale.ContextMayProceed);
+        using var staleCommand = await CliExpectExit(5, "agent", "doctor", "--config-root", fixture.Config);
+        Assert.Equal("VAULT_REGISTRY_VIEW_STALE", staleCommand.RootElement.GetProperty("code").GetString());
+        using var blockedContext = await CliExpectExit(5, "agent", "context", "--config-root", fixture.Config, "--session-id", "doctor-session", "--operation", "read", "--subjects", "memory");
+        Assert.Equal("VAULT_REGISTRY_VIEW_STALE", blockedContext.RootElement.GetProperty("code").GetString());
+        Assert.Equal("likely-stale-registry-view", blockedContext.RootElement.GetProperty("data").GetProperty("status").GetString());
+
+        registry["vaults"]![0]!["last_verified_at"] = "2030-01-01T00:00:00Z";
+        await File.WriteAllTextAsync(registryPath, registry.ToJsonString(IndentedJson) + "\n", TestContext.Current.CancellationToken);
+        var mismatch = await AgentSessions.DiagnoseViewAsync(fixture.Config, TestContext.Current.CancellationToken);
+        Assert.Equal("integrity-mismatch", mismatch.Status);
+        Assert.False(mismatch.ContextMayProceed);
+    }
+
+    [Fact]
+    public async Task ConcurrentProtectedWritersCannotLeaveManifestAndRegistryOutOfSync()
+    {
+        using var fixture = await Fixture.CreateAsync(TestContext.Current.CancellationToken);
+        var original = await VaultAuthoring.ReadAsync(fixture.Vault, "index.md", TestContext.Current.CancellationToken);
+        var firstContent = original.Content.Replace("## Projects", "First writer\n\n## Projects", StringComparison.Ordinal);
+        var secondContent = original.Content.Replace("## Projects", "Second writer\n\n## Projects", StringComparison.Ordinal);
+
+        var attempts = await Task.WhenAll(
+            CaptureWriteAsync(new VaultWriteRequest(fixture.Vault, fixture.Config, "index.md", firstContent, original.RawSha256)),
+            CaptureWriteAsync(new VaultWriteRequest(fixture.Vault, fixture.Config, "index.md", secondContent, original.RawSha256)));
+
+        Assert.Single(attempts, result => result is not null);
+        var finalRead = await VaultAuthoring.ReadAsync(fixture.Vault, "index.md", TestContext.Current.CancellationToken);
+        Assert.True(finalRead.Content == firstContent || finalRead.Content == secondContent);
+        var manifest = await File.ReadAllTextAsync(Path.Combine(fixture.Vault, ".vault-system", "content-integrity.json"), TestContext.Current.CancellationToken);
+        var registry = await File.ReadAllTextAsync(Path.Combine(fixture.Config, "vault-registry.json"), TestContext.Current.CancellationToken);
+        Assert.Contains(CanonicalHash.Text(finalRead.Content).ToUpperInvariant(), manifest, StringComparison.Ordinal);
+        Assert.Contains(CanonicalHash.Text(manifest).ToUpperInvariant(), registry, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task OneHundredContextReadersWaitForAProtectedWriterAndThenComplete()
+    {
+        using var fixture = await Fixture.CreateAsync(TestContext.Current.CancellationToken);
+        var sessionIds = Enumerable.Range(0, 100).Select(index => $"waiting-session-{index:D3}").ToArray();
+        await Task.WhenAll(sessionIds.Select(sessionId => AgentSessions.RegisterAsync(
+            fixture.Config,
+            sessionId,
+            $"Waiting agent {sessionId}",
+            fixture.Root,
+            "global",
+            "synthetic",
+            TestContext.Current.CancellationToken)));
+
+        var writer = await VaultIntegrityTransaction.AcquireWriterAsync(fixture.Vault, TestContext.Current.CancellationToken);
+        Task<AgentContextResult>[] readers = [];
+        try
+        {
+            readers = sessionIds.Select(sessionId => AgentSessions.BuildContextAsync(
+                fixture.Config,
+                sessionId,
+                TaskOperation.Read,
+                ["memory"],
+                [],
+                ContextAudience.Private,
+                false,
+                0,
+                null,
+                cancellationToken: TestContext.Current.CancellationToken)).ToArray();
+            await Task.Delay(100, TestContext.Current.CancellationToken);
+            Assert.All(readers, reader => Assert.False(reader.IsCompleted));
+        }
+        finally
+        {
+            await writer.DisposeAsync();
+        }
+
+        var contexts = await Task.WhenAll(readers);
+        Assert.All(contexts, context => Assert.True(context.StartupComplete));
+    }
+
+    [Fact]
+    public async Task OneHundredAgentsCanImportTheSameNewGitBackedProject()
+    {
+        using var fixture = await Fixture.CreateAsync(TestContext.Current.CancellationToken);
+        await Git(fixture.Root, "init");
+        await Git(fixture.Root, "config user.email fixture@example.invalid");
+        await Git(fixture.Root, "config user.name Fixture");
+        var projectId = Guid.NewGuid().ToString("D");
+        await RepositoryAgentsAuthoring.InitializeAsync(
+            fixture.Root,
+            projectId,
+            "shared-clone",
+            "Shared Clone",
+            TestContext.Current.CancellationToken);
+        await Git(fixture.Root, "add -- .agents");
+        await Git(fixture.Root, "commit -m initial-agents");
+
+        var sessionIds = Enumerable.Range(0, 100).Select(index => $"clone-session-{index:D3}").ToArray();
+        await Task.WhenAll(sessionIds.Select(sessionId => AgentSessions.RegisterAsync(
+            fixture.Config,
+            sessionId,
+            $"Clone agent {sessionId}",
+            fixture.Root,
+            "shared-clone",
+            "synthetic",
+            TestContext.Current.CancellationToken)));
+
+        var contexts = await Task.WhenAll(sessionIds.Select(sessionId => AgentSessions.BuildContextAsync(
+            fixture.Config,
+            sessionId,
+            TaskOperation.Read,
+            ["project"],
+            [".agents/project.json"],
+            ContextAudience.Private,
+            false,
+            0,
+            null,
+            cancellationToken: TestContext.Current.CancellationToken)));
+
+        Assert.All(contexts, context => Assert.True(context.StartupComplete));
+        var imported = await VaultAuthoring.InspectProjectAsync(fixture.Vault, "shared-clone", TestContext.Current.CancellationToken);
+        Assert.Equal(projectId, imported.ProjectId, ignoreCase: true);
+    }
+
+    private static async Task<VaultWriteResult?> CaptureWriteAsync(VaultWriteRequest request)
+    {
+        try
+        {
+            return await VaultAuthoring.WriteAsync(request, TestContext.Current.CancellationToken);
+        }
+        catch (Exception exception) when (exception is WriteConflictException or VaultAuthoringException { Code: "WRITE_PRECONDITION_FAILED" })
+        {
+            return null;
+        }
+    }
     [Fact]
     public async Task ProtectedWriteReanchorsManifestAndRegistry()
     {

@@ -19,7 +19,17 @@ public sealed record VaultWriteResult(string RelativePath, string RawSha256, boo
 public sealed record InboundLinkInfo(string RelativePath, string FileId, bool HasInboundLinks, IReadOnlyList<string> InboundSources);
 public sealed record VaultLinkInspection(VaultReadResult File, InboundLinkInfo Links);
 public sealed record DailyInspection(string Project, string ActiveRelativePath, string ActiveRawSha256, string ActiveContent, DateOnly ActiveDate, bool RolloverRequired);
-public sealed record ProjectCreateRequest(string VaultRoot, string ConfigRoot, string Slug, string Title, string? Purpose, string? EndGoal);
+public sealed record ProjectCreateRequest(
+    string VaultRoot,
+    string ConfigRoot,
+    string Slug,
+    string Title,
+    string? Purpose,
+    string? EndGoal,
+    string? ProjectId = null,
+    string? StorageMode = null,
+    string? GitState = null,
+    string? RecentLocation = null);
 public sealed record ProjectCreateResult(string Project, string ProjectId, IReadOnlyList<string> CreatedPaths, IReadOnlyList<string> ChangedPaths, string RootIndexRawSha256);
 public sealed record ProjectInspection(string Project, string ProjectId, string StorageMode, string GitState, string RawSha256);
 
@@ -229,7 +239,14 @@ public static class VaultAuthoring
         var purpose = string.IsNullOrWhiteSpace(request.Purpose) ? "Unknown - user input required." : request.Purpose.Trim();
         var goal = string.IsNullOrWhiteSpace(request.EndGoal) ? "Unknown - user input required." : request.EndGoal.Trim();
         var date = DateOnly.FromDateTime(DateTime.Now);
-        var projectId = Guid.NewGuid().ToString("D");
+        var projectId = request.ProjectId ?? Guid.NewGuid().ToString("D");
+        if (!Guid.TryParse(projectId, out _))
+        {
+            throw new VaultAuthoringException("PROJECT_ID_INVALID", "Imported project identity must use a UUID project_id.");
+        }
+        var storageMode = string.IsNullOrWhiteSpace(request.StorageMode) ? "local-private" : request.StorageMode;
+        var gitState = string.IsNullOrWhiteSpace(request.GitState) ? "local-private" : request.GitState;
+        var recentLocations = string.IsNullOrWhiteSpace(request.RecentLocation) ? Array.Empty<string>() : new[] { request.RecentLocation };
         var files = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             [$"{basePath}/project.json"] = JsonSerializer.Serialize(new
@@ -238,9 +255,9 @@ public static class VaultAuthoring
                 project_id = projectId,
                 project_slug = request.Slug,
                 title = request.Title,
-                storage_mode = "local-private",
-                git_state = "local-private",
-                recent_locations = Array.Empty<string>(),
+                storage_mode = storageMode,
+                git_state = gitState,
+                recent_locations = recentLocations,
                 updated_at = now.ToUniversalTime().ToString("O")
             }, IndentedJson) + "\n",
             [$"{basePath}/index.md"] = ProjectRouter(request.Slug, request.Title, purpose),
@@ -397,6 +414,11 @@ public static class VaultAuthoring
 
     private static async Task ApplyBatchAsync(string vaultRoot, IReadOnlyList<Mutation> mutations, CancellationToken cancellationToken)
     {
+        if (mutations.Count == 0)
+        {
+            return;
+        }
+
         var duplicate = mutations.GroupBy(m => $"{Path.GetFullPath(m.Root)}::{m.Path}", StringComparer.OrdinalIgnoreCase).FirstOrDefault(group => group.Count() > 1);
         if (duplicate is not null)
         {
@@ -405,13 +427,19 @@ public static class VaultAuthoring
 
         var locks = new List<ProtectedLock>();
         var stateRoot = Path.Combine(vaultRoot, ".vault-system");
+        await using var integrityTransaction = await VaultIntegrityTransaction.AcquireWriterAsync(vaultRoot, cancellationToken);
         try
         {
             foreach (var target in mutations.OrderBy(m => m.Root, StringComparer.OrdinalIgnoreCase).ThenBy(m => m.Path, StringComparer.Ordinal))
             {
-                locks.Add(await ProtectedLock.AcquireAsync(stateRoot, $"{Path.GetFullPath(target.Root)}::{target.Path}", cancellationToken: cancellationToken));
+                locks.Add(await ProtectedLock.AcquireAsync(
+                    stateRoot,
+                    $"{Path.GetFullPath(target.Root)}::{target.Path}",
+                    waitTimeout: VaultIntegrityTransaction.WriterWaitTimeout,
+                    cancellationToken: cancellationToken));
             }
 
+            await VerifyMutationPreconditionsAsync(mutations, cancellationToken);
             var transaction = new TransactionJournal(1, Guid.NewGuid().ToString("D"), locks[0].WriterId, TransactionState.Prepared, DateTimeOffset.UtcNow,
                 mutations.Select(m => new TransactionTarget($"{Path.GetFullPath(m.Root)}::{m.Path}", m.BeforeRawSha256, m.Content is null ? "DELETE" : CanonicalHash.Raw(Encoding.UTF8.GetBytes(m.Content)))).ToArray());
             await JournalStore.WriteAsync(stateRoot, transaction, cancellationToken);
@@ -433,6 +461,40 @@ public static class VaultAuthoring
             foreach (var item in locks.AsEnumerable().Reverse())
             {
                 await item.DisposeAsync();
+            }
+        }
+    }
+
+    private static async Task VerifyMutationPreconditionsAsync(IReadOnlyList<Mutation> mutations, CancellationToken cancellationToken)
+    {
+        foreach (var mutation in mutations)
+        {
+            var target = SafePath.ValidateRelative(mutation.Root, mutation.Path, SafePathProfile.PrivateConfig);
+            TrustedFileSystem.EnsureSupported(target);
+            var exists = File.Exists(target.FullPath!);
+            if (mutation.BeforeRawSha256 == "MISSING")
+            {
+                if (exists)
+                {
+                    throw new WriteConflictException($"Write precondition failed for '{mutation.Path}'.");
+                }
+
+                continue;
+            }
+
+            if (!exists)
+            {
+                throw new WriteConflictException($"Write precondition failed for '{mutation.Path}'.");
+            }
+
+            var current = await TrustedFileSystem.ReadAllBytesAsync(
+                mutation.Root,
+                mutation.Path,
+                SafePathProfile.PrivateConfig,
+                cancellationToken: cancellationToken);
+            if (!string.Equals(CanonicalHash.Raw(current), mutation.BeforeRawSha256, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new WriteConflictException($"Write precondition failed for '{mutation.Path}'.");
             }
         }
     }

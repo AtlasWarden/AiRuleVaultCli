@@ -249,6 +249,55 @@ public static class LifecyclePlanner
         var archiveRoot = $".vault-system/archive/{now.UtcDateTime:yyyyMMddTHHmmssZ}-{Guid.NewGuid():N}";
         var archivedLegacyFiles = 0;
 
+        foreach (var entry in entriesByPath.Values.ToArray())
+        {
+            if (!entry.Path.EndsWith(".md", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var currentBytes = await reads.ReadBytesAsync(vaultRoot, entry.Path, SafePathProfile.PrivateConfig, cancellationToken);
+            var current = CanonicalHash.DecodeUtf8(currentBytes, allowBom: false);
+            // Installer-owned runtime prose intentionally has no managed frontmatter. A
+            // package-owned document that does have frontmatter (notably a divergent root
+            // index) is still migrated so mediated authoring can safely update it later.
+            if (packagePaths.Contains(entry.Path, StringComparer.Ordinal) &&
+                !current.StartsWith("---\n", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            try
+            {
+                _ = ManagedDocumentMetadataValidator.Parse(entry.Path, current, requireCompleteSchema: true);
+                continue;
+            }
+            catch (VaultAuthoringException)
+            {
+                // Attempt only the deterministic additive conversion below.
+            }
+
+            var upgraded = UpgradeLegacyManagedFrontmatter(entry.Path, current, entry, now);
+            _ = ManagedDocumentMetadataValidator.Parse(entry.Path, upgraded, requireCompleteSchema: true);
+            operations.Add(Create($"{archiveRoot}/frontmatter-before/{entry.Path}", current, "archive"));
+            operations.Add(new LifecycleOperation(
+                Guid.NewGuid().ToString("D"),
+                LifecycleOperationKind.Replace,
+                entry.Path,
+                CanonicalHash.Raw(currentBytes),
+                upgraded,
+                "mixed",
+                ["RV-MIG-001", "RV-INTEGRITY-001", "RV-WRITE-001"]));
+            entriesByPath[entry.Path] = entry with
+            {
+                Sha256 = CanonicalHash.Text(upgraded).ToUpperInvariant(),
+                Revision = checked(entry.Revision + 1),
+                ChangeOrigin = "migration",
+                ChangedAt = now.ToUniversalTime().ToString("O")
+            };
+            convertedVendorFiles++;
+            archivedLegacyFiles++;
+        }
+
         foreach (var migration in migrationRules)
         {
             if (!entriesByPath.TryGetValue(migration.From, out var sourceEntry) ||
@@ -678,6 +727,46 @@ public static class LifecyclePlanner
             }
         }
 
+        // A verified route catalog is authoritative about which files the agent
+        // runtime may load. Older installations can contain routed files that
+        // predate the current metadata schema, so enroll their current bytes
+        // instead of leaving agent startup permanently blocked.
+        const string routeCatalogPath = ".vault-system/routes.json";
+        if (protectedPaths.Contains(routeCatalogPath))
+        {
+            var routeBytes = await reads.ReadBytesAsync(vaultRoot, routeCatalogPath, SafePathProfile.PrivateConfig, cancellationToken);
+            using var routeDocument = StrictJson.Parse(routeBytes);
+            if (!routeDocument.RootElement.TryGetProperty("routes", out var routes) || routes.ValueKind != JsonValueKind.Array)
+            {
+                throw new LifecycleException("ROUTE_CATALOG_INVALID", "The protected route catalog has no routes array.");
+            }
+
+            foreach (var route in routes.EnumerateArray())
+            {
+                if (!route.TryGetProperty("path", out var routePath) || routePath.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(routePath.GetString()))
+                {
+                    throw new LifecycleException("ROUTE_CATALOG_INVALID", "The protected route catalog contains a route without a valid path.");
+                }
+
+                var relativePath = routePath.GetString()!;
+                if (protectedPaths.Contains(relativePath) || result.Any(entry => entry.Path == relativePath))
+                {
+                    continue;
+                }
+
+                var target = SafePath.ValidateRelative(vaultRoot, relativePath, SafePathProfile.PrivateConfig);
+                TrustedFileSystem.EnsureSupported(target);
+                if (!File.Exists(target.FullPath))
+                {
+                    throw new LifecycleException("ROUTE_CONTENT_MISSING", $"The protected route catalog points to a missing file: '{relativePath}'.");
+                }
+
+                var content = await reads.ReadTextAsync(vaultRoot, relativePath, SafePathProfile.PrivateConfig, cancellationToken);
+                _ = IsMandatoryLegacyDocument(relativePath, content, out var fileId);
+                result.Add(new IntegrityEntry(fileId, relativePath, CanonicalHash.Text(content).ToUpperInvariant(), 1, "migration", now.ToUniversalTime().ToString("O")));
+            }
+        }
+
         return result.OrderBy(entry => entry.Path, StringComparer.Ordinal).ToArray();
     }
 
@@ -694,6 +783,97 @@ public static class LifecyclePlanner
         {
             return false;
         }
+    }
+
+    private static string UpgradeLegacyManagedFrontmatter(string relativePath, string content, IntegrityEntry entry, DateTimeOffset now)
+    {
+        if (!content.StartsWith("---\n", StringComparison.Ordinal))
+        {
+            throw new LifecycleException("MANAGED_FRONTMATTER_MIGRATION_UNSAFE", $"'{relativePath}' does not have deterministic managed frontmatter and was not changed.");
+        }
+
+        var end = content.IndexOf("\n---\n", 4, StringComparison.Ordinal);
+        if (end < 0)
+        {
+            throw new LifecycleException("MANAGED_FRONTMATTER_MIGRATION_UNSAFE", $"'{relativePath}' has no closing frontmatter delimiter and was not changed.");
+        }
+
+        IReadOnlyDictionary<string, object?> metadata;
+        try
+        {
+            metadata = StrictYaml.ParseFrontmatter(content[4..end]);
+        }
+        catch (StorageFormatException exception)
+        {
+            throw new LifecycleException("MANAGED_FRONTMATTER_MIGRATION_UNSAFE", $"'{relativePath}' has invalid legacy frontmatter and was not changed: {exception.Message}");
+        }
+
+        var frontmatterLines = content[4..end].Split('\n').ToList();
+        var convertedLegacyValue = false;
+        if (metadata.TryGetValue("file_id", out var fileIdValue) &&
+            fileIdValue is string legacyFileId &&
+            !Guid.TryParse(legacyFileId, out _))
+        {
+            ReplaceFrontmatterScalar(frontmatterLines, "file_id", entry.FileId);
+            convertedLegacyValue = true;
+        }
+
+        if (metadata.TryGetValue("status", out var statusValue) &&
+            statusValue is string status &&
+            status is "planning" or "parked")
+        {
+            ReplaceFrontmatterScalar(frontmatterLines, "status", "active");
+            convertedLegacyValue = true;
+        }
+
+        if (relativePath.EndsWith("/index.md", StringComparison.Ordinal) &&
+            metadata.TryGetValue("kind", out var kindValue) &&
+            kindValue is string kind &&
+            kind is "project" or "rules" or "rules-index" or "context-index" or "private-context-index" or "daily-index" or "daily-archive-index")
+        {
+            ReplaceFrontmatterScalar(frontmatterLines, "kind", "index");
+            convertedLegacyValue = true;
+        }
+
+        var additions = new List<string>();
+        if (!metadata.ContainsKey("aliases")) { additions.Add("aliases: []"); }
+        if (!metadata.ContainsKey("hasInboundLinks")) { additions.Add("hasInboundLinks: false"); }
+        if (!metadata.ContainsKey("created"))
+        {
+            var created = string.IsNullOrWhiteSpace(entry.ChangedAt) ? now.ToUniversalTime().ToString("O") : entry.ChangedAt;
+            additions.Add($"created: \"{created.Replace("\"", "\\\"")}\"");
+        }
+        if (!metadata.ContainsKey("project"))
+        {
+            var segments = relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            var project = segments.Length > 1 && segments[0] == "projects" ? segments[1] : "global";
+            additions.Add($"project: \"{project}\"");
+        }
+
+        if (additions.Count == 0 && !convertedLegacyValue)
+        {
+            throw new LifecycleException("MANAGED_FRONTMATTER_MIGRATION_UNSAFE", $"'{relativePath}' is invalid for a reason that cannot be converted automatically and was not changed.");
+        }
+
+        var upgradedFrontmatter = string.Join("\n", frontmatterLines);
+        if (additions.Count > 0)
+        {
+            upgradedFrontmatter += "\n" + string.Join("\n", additions);
+        }
+
+        return "---\n" + upgradedFrontmatter + content[end..];
+    }
+
+    private static void ReplaceFrontmatterScalar(List<string> lines, string key, string value)
+    {
+        var prefix = key + ":";
+        var index = lines.FindIndex(line => line.StartsWith(prefix, StringComparison.Ordinal));
+        if (index < 0)
+        {
+            throw new LifecycleException("MANAGED_FRONTMATTER_MIGRATION_UNSAFE", $"Legacy frontmatter key '{key}' could not be converted safely.");
+        }
+
+        lines[index] = $"{key}: \"{value}\"";
     }
 
     private static string BuildIntegrityManifest(string vaultId, DateTimeOffset now, IReadOnlyList<LifecycleOperation> protectedContent)
@@ -1089,6 +1269,13 @@ public sealed class LifecycleApplier
 
         Directory.CreateDirectory(plan.VaultRoot);
         Directory.CreateDirectory(plan.ConfigRoot);
+        await using var integrityTransaction = await VaultIntegrityTransaction.AcquireWriterAsync(plan.VaultRoot, cancellationToken);
+        foreach (var operation in plan.Operations)
+        {
+            var root = operation.RelativePath == "vault-registry.json" ? plan.ConfigRoot : plan.VaultRoot;
+            await VerifyOperationPreconditionAsync(root, operation, cancellationToken);
+        }
+
         var written = new List<string>();
         foreach (var operation in plan.Operations.Where(operation => operation.RelativePath is not "vault-registry.json" and not ".vault-system/content-integrity.json"))
         {
@@ -1109,6 +1296,52 @@ public sealed class LifecycleApplier
         }
 
         return written;
+    }
+
+    private static async Task VerifyOperationPreconditionAsync(string root, LifecycleOperation operation, CancellationToken cancellationToken)
+    {
+        if (operation.Kind == LifecycleOperationKind.Preserve)
+        {
+            return;
+        }
+
+        var target = SafePath.ValidateRelative(root, operation.RelativePath, SafePathProfile.PrivateConfig);
+        TrustedFileSystem.EnsureSupported(target);
+        var exists = File.Exists(target.FullPath!);
+        if (operation.Kind == LifecycleOperationKind.RemoveOwned && !exists)
+        {
+            return;
+        }
+
+        if (operation.BeforeRawSha256 == "MISSING")
+        {
+            if (!exists)
+            {
+                return;
+            }
+
+            if (operation.Content is not null)
+            {
+                var existing = await TrustedFileSystem.ReadTextAsync(root, operation.RelativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+                if (string.Equals(existing, operation.Content, StringComparison.Ordinal))
+                {
+                    return;
+                }
+            }
+
+            throw new LifecycleException("PLAN_STALE", $"Create target '{operation.RelativePath}' already exists with different content.");
+        }
+
+        if (!exists)
+        {
+            throw new LifecycleException("PLAN_STALE", $"Target '{operation.RelativePath}' no longer exists.");
+        }
+
+        var current = await TrustedFileSystem.ReadAllBytesAsync(root, operation.RelativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+        if (!string.Equals(CanonicalHash.Raw(current), operation.BeforeRawSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new LifecycleException("PLAN_STALE", $"Target '{operation.RelativePath}' changed after planning.");
+        }
     }
 
     private static async Task ApplyOperationAsync(string root, LifecycleOperation operation, CancellationToken cancellationToken)

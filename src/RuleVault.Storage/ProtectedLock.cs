@@ -29,35 +29,57 @@ public sealed class ProtectedLock : IAsyncDisposable
         string stateRoot,
         string target,
         int leaseSeconds = 900,
+        TimeSpan? waitTimeout = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(leaseSeconds);
+        if (waitTimeout is { } timeout && timeout < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(waitTimeout));
+        }
 
-        var lockId = CanonicalHash.Raw(Encoding.UTF8.GetBytes(target));
-        var lockPath = Path.Combine(stateRoot, "locks", $"{lockId}.lock");
+        var lockPath = GetLockPath(stateRoot, target);
         Directory.CreateDirectory(Path.GetDirectoryName(lockPath)!);
         var now = DateTimeOffset.UtcNow;
         var owner = new LockOwner(Guid.NewGuid().ToString("D"), target, now, now, leaseSeconds);
         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(owner, JsonOptions));
+        var started = DateTimeOffset.UtcNow;
 
-        try
+        while (true)
         {
-            await using var stream = new FileStream(lockPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 4096, useAsync: true);
-            await stream.WriteAsync(bytes, cancellationToken);
-            await stream.FlushAsync(cancellationToken);
-        }
-        catch (IOException ex) when (File.Exists(lockPath))
-        {
-            throw new WriteConflictException($"Protected lock is busy for '{target}'.", ex);
-        }
-        catch
-        {
-            TryDelete(lockPath);
-            throw;
-        }
+            cancellationToken.ThrowIfCancellationRequested();
+            var created = false;
+            try
+            {
+                await using var stream = new FileStream(lockPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 4096, useAsync: true);
+                created = true;
+                await stream.WriteAsync(bytes, cancellationToken);
+                await stream.FlushAsync(cancellationToken);
+                return new ProtectedLock(lockPath, owner);
+            }
+            catch (IOException ex) when (File.Exists(lockPath))
+            {
+                if (waitTimeout is null || DateTimeOffset.UtcNow - started >= waitTimeout.Value)
+                {
+                    throw new WriteConflictException($"Protected lock is busy for '{target}'.", ex);
+                }
 
-        return new ProtectedLock(lockPath, owner);
+                var remaining = waitTimeout.Value - (DateTimeOffset.UtcNow - started);
+                var delay = TimeSpan.FromMilliseconds(Math.Min(Random.Shared.Next(8, 26), Math.Max(1, remaining.TotalMilliseconds)));
+                await Task.Delay(delay, cancellationToken);
+            }
+            catch
+            {
+                if (created)
+                {
+                    TryDelete(lockPath);
+                }
+                throw;
+            }
+        }
     }
+
+    public static bool IsHeld(string stateRoot, string target) => File.Exists(GetLockPath(stateRoot, target));
 
     public async Task HeartbeatAsync(CancellationToken cancellationToken = default)
     {
@@ -112,7 +134,7 @@ public sealed class ProtectedLock : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         var lockId = CanonicalHash.Raw(Encoding.UTF8.GetBytes(target));
-        var lockPath = Path.Combine(stateRoot, "locks", $"{lockId}.lock");
+        var lockPath = GetLockPath(stateRoot, target);
         if (!File.Exists(lockPath))
         {
             return null;
@@ -155,6 +177,12 @@ public sealed class ProtectedLock : IAsyncDisposable
     {
         var bytes = await File.ReadAllBytesAsync(path, cancellationToken);
         return StrictJson.Deserialize<LockOwner>(bytes);
+    }
+
+    private static string GetLockPath(string stateRoot, string target)
+    {
+        var lockId = CanonicalHash.Raw(Encoding.UTF8.GetBytes(target));
+        return Path.Combine(stateRoot, "locks", $"{lockId}.lock");
     }
 
     private void EnsureNotReleased()

@@ -4,8 +4,8 @@
     <RootNamespace>RuleVault.Cli</RootNamespace>
     <AssemblyName>rv</AssemblyName>
     <ApplicationIcon />
-    <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>true</SelfContained>
+    <PublishSingleFile Condition="'$(PublishSingleFile)' == ''">true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
     <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
   <ItemGroup>
