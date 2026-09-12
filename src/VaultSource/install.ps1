@@ -263,6 +263,25 @@ function Get-CanonicalTextSha256([string] $Path) {
     }
 }
 
+function Get-RegistryManifestState([string] $VaultRoot, [string] $ConfigRoot, [string] $VaultId) {
+    $manifestPath = Join-Path $VaultRoot '.vault-system\content-integrity.json'
+    $registryPath = Join-Path $ConfigRoot 'vault-registry.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf) -or -not (Test-Path -LiteralPath $registryPath -PathType Leaf)) {
+        throw 'The installed vault is missing its integrity manifest or registry.'
+    }
+
+    $manifestSha256 = Get-CanonicalTextSha256 $manifestPath
+    $registry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+    $entries = @($registry.vaults | Where-Object { [string]$_.vault_id -eq $VaultId })
+    if ($entries.Count -ne 1) { throw 'The installed vault has no single matching registry entry.' }
+    $recordedSha256 = [string]$entries[0].protected_content_manifest_sha256
+    return [pscustomobject]@{
+        Matches = [string]::Equals($recordedSha256, $manifestSha256, [StringComparison]::OrdinalIgnoreCase)
+        RecordedSha256 = $recordedSha256
+        ManifestSha256 = $manifestSha256
+    }
+}
+
 function Install-TrustedCli([string] $VerifiedArtifact, [string] $ExpectedSha256, [string] $ConfigRoot, [string] $GuideHash) {
     $cliDirectory = Join-Path $ConfigRoot 'cli'
     $cliPath = Join-Path $cliDirectory 'rv.exe'
@@ -490,6 +509,18 @@ if ($existingVault) {
     $operation = 'Update the existing vault'
 }
 
+if ($existingVault) {
+    $registryManifestState = Get-RegistryManifestState $vaultRootFull $configRootFull $VaultId
+    if (-not $registryManifestState.Matches) {
+        $mismatch = [pscustomobject]@{ code = 'VAULT_REGISTRY_INTEGRITY_MISMATCH' }
+        $script:IntegrityRepairOutcome = 'not-attempted'
+        if (-not (Invoke-IntegrityRepair $artifactPath $packageRootFull $vaultRootFull $configRootFull $VaultId 'accept-current' $mismatch)) {
+            if ($script:IntegrityRepairOutcome -in @('planned', 'cancelled')) { exit 0 }
+            throw 'The saved vault fingerprint could not be repaired.'
+        }
+    }
+}
+
 $planDirectory = Split-Path -Parent $planPathFull
 if (-not (Test-Path -LiteralPath $planDirectory)) { New-Item -ItemType Directory -Path $planDirectory -Force | Out-Null }
 
@@ -541,6 +572,9 @@ if ($LASTEXITCODE -ne 0) {
 
 if ((($applyResult | Out-String | ConvertFrom-Json).code) -eq 'OK') {
     Confirm-InstalledVaultReady $artifactPath $packageRootFull $vaultRootFull $configRootFull $VaultId $guideSha256 $IntegrityRepairStrategy
+    if (-not (Get-RegistryManifestState $vaultRootFull $configRootFull $VaultId).Matches) {
+        throw 'The installer could not make the saved vault fingerprint match the current integrity manifest. Success was not reported.'
+    }
     Update-InstallerProgress 95 'Installing the verified local CLI'
     try { $cliInstall = Install-TrustedCli $artifactPath $artifact.raw_sha256 $configRootFull $guideSha256 }
     catch {
