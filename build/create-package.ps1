@@ -49,10 +49,10 @@ if ($null -eq $CliArtifactDirectory) {
 Write-Progress -Activity "Building Installer Package" -Status "Staging compilation artifacts..." -PercentComplete 85
 
 $artifactRoot = [IO.Path]::GetFullPath($CliArtifactDirectory)
-$executable = Join-Path $artifactRoot 'rv.exe'
+$executable = Join-Path $artifactRoot 'rulevault.exe'
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
     Write-Progress -Activity "Building Installer Package" -Completed
-    Write-Host " ❌  [ERROR] Compiled executable 'rv.exe' was missing from $artifactRoot" -ForegroundColor Red
+    Write-Host " ❌  [ERROR] Compiled executable 'rulevault.exe' was missing from $artifactRoot" -ForegroundColor Red
     exit 1
 }
 
@@ -66,7 +66,7 @@ New-Item -ItemType Directory -Path (Join-Path $outputRoot 'bin\win-x64') -Force 
 New-Item -ItemType Directory -Path (Join-Path $outputRoot 'runtime-payload') -Force | Out-Null
 
 Write-Host " 📦  Staging structural package configuration files..." -ForegroundColor Gray
-Copy-Item -LiteralPath $executable -Destination (Join-Path $outputRoot 'bin\win-x64\rv.exe') -Force
+Copy-Item -LiteralPath $executable -Destination (Join-Path $outputRoot 'bin\win-x64\rulevault.exe') -Force
 
 $sourcePayload = Join-Path $sourceRoot 'runtime-payload'
 if (Test-Path -Path $sourcePayload -PathType Container) {
@@ -89,7 +89,7 @@ foreach ($file in $requiredFiles) {
 
 Write-Progress -Activity "Building Installer Package" -Status "Generating cryptographic release manifest..." -PercentComplete 95
 
-$artifactPath = Join-Path $outputRoot 'bin\win-x64\rv.exe'
+$artifactPath = Join-Path $outputRoot 'bin\win-x64\rulevault.exe'
 $packageFiles = @(Get-ChildItem -LiteralPath $outputRoot -Recurse -File | Where-Object {
     $_.FullName -ne $artifactPath -and $_.Name -ne 'artifacts.json'
 } | Sort-Object FullName | ForEach-Object {
@@ -105,7 +105,7 @@ $manifest = [ordered]@{
     artifacts = @(
         [ordered]@{
             rid = 'win-x64'
-            relative_path = 'bin/win-x64/rv.exe'
+            relative_path = 'bin/win-x64/rulevault.exe'
             raw_sha256 = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash
             size = (Get-Item -LiteralPath $artifactPath).Length
             tested = $true

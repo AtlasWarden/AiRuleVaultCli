@@ -313,13 +313,75 @@ function Get-RegistryManifestState([string] $VaultRoot, [string] $ConfigRoot, [s
     }
 }
 
+function Get-RuleVaultUserPathUpdate([string] $CurrentPath, [string] $CliDirectory) {
+    if ($CliDirectory.Contains(';')) {
+        throw 'The Rule Vault CLI folder contains a semicolon and cannot be safely added to PATH.'
+    }
+
+    $fullCliDirectory = [IO.Path]::GetFullPath($CliDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $entries = @($CurrentPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $alreadyPresent = $false
+    foreach ($entry in $entries) {
+        try {
+            $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim())
+            $normalized = [IO.Path]::GetFullPath($expanded).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+            if ([string]::Equals($normalized, $fullCliDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+                $alreadyPresent = $true
+                break
+            }
+        } catch {
+            # Keep unrelated PATH entries exactly as the user configured them.
+        }
+    }
+
+    if (-not $alreadyPresent) { $entries += $fullCliDirectory }
+    return [pscustomobject]@{ Value = if ($alreadyPresent) { $CurrentPath } else { $entries -join ';' }; Added = -not $alreadyPresent }
+}
+
+function Get-RuleVaultUserPathValue {
+    return [Environment]::GetEnvironmentVariable('Path', [EnvironmentVariableTarget]::User)
+}
+
+function Set-RuleVaultUserPathValue([string] $Value) {
+    [Environment]::SetEnvironmentVariable('Path', $Value, [EnvironmentVariableTarget]::User)
+}
+
+function Add-RuleVaultToUserPath([string] $CliDirectory) {
+    $userPath = Get-RuleVaultUserPathValue
+    $userUpdate = Get-RuleVaultUserPathUpdate $userPath $CliDirectory
+    if ($userUpdate.Added) {
+        Set-RuleVaultUserPathValue $userUpdate.Value
+    }
+
+    $processUpdate = Get-RuleVaultUserPathUpdate $env:Path $CliDirectory
+    if ($processUpdate.Added) { $env:Path = $processUpdate.Value }
+
+    return $userUpdate.Added
+}
+
 function Install-TrustedCli([string] $VerifiedArtifact, [string] $ExpectedSha256, [string] $ConfigRoot, [string] $GuideHash) {
     $cliDirectory = Join-Path $ConfigRoot 'cli'
-    $cliPath = Join-Path $cliDirectory 'rv.exe'
+    $cliPath = Join-Path $cliDirectory 'rulevault.exe'
+    $legacyCliPath = Join-Path $cliDirectory 'rv.exe'
     $descriptorPath = Join-Path $ConfigRoot 'rule-vault-cli.json'
     New-Item -ItemType Directory -Path $cliDirectory -Force | Out-Null
 
-    $stage = Join-Path $cliDirectory ('.rv.' + [guid]::NewGuid().ToString('N') + '.stage')
+    $removeOwnedLegacyCli = $false
+    if ((Test-Path -LiteralPath $legacyCliPath -PathType Leaf) -and (Test-Path -LiteralPath $descriptorPath -PathType Leaf)) {
+        try {
+            $oldDescriptor = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json
+            $oldExecutablePath = [IO.Path]::GetFullPath([string]$oldDescriptor.executable_path)
+            $oldExpectedHash = [string]$oldDescriptor.executable_raw_sha256
+            $removeOwnedLegacyCli = [string]::Equals($oldExecutablePath, [IO.Path]::GetFullPath($legacyCliPath), [StringComparison]::OrdinalIgnoreCase) -and
+                -not [string]::IsNullOrWhiteSpace($oldExpectedHash) -and
+                [string]::Equals((Get-FileHash -LiteralPath $legacyCliPath -Algorithm SHA256).Hash, $oldExpectedHash, [StringComparison]::OrdinalIgnoreCase)
+        } catch {
+            # An unknown or damaged legacy executable is user evidence; leave it untouched.
+            $removeOwnedLegacyCli = $false
+        }
+    }
+
+    $stage = Join-Path $cliDirectory ('.rulevault.' + [guid]::NewGuid().ToString('N') + '.stage')
     try {
         Copy-Item -LiteralPath $VerifiedArtifact -Destination $stage -Force
         $stageHash = (Get-FileHash -LiteralPath $stage -Algorithm SHA256).Hash
@@ -330,6 +392,12 @@ function Install-TrustedCli([string] $VerifiedArtifact, [string] $ExpectedSha256
     } finally {
         if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Force }
     }
+
+    if ($removeOwnedLegacyCli) {
+        Remove-Item -LiteralPath $legacyCliPath -Force
+    }
+
+    $pathAdded = Add-RuleVaultToUserPath $cliDirectory
 
     $descriptor = [ordered]@{
         schema_version = 1
@@ -347,7 +415,7 @@ function Install-TrustedCli([string] $VerifiedArtifact, [string] $ExpectedSha256
     } finally {
         if (Test-Path -LiteralPath $descriptorStage) { Remove-Item -LiteralPath $descriptorStage -Force }
     }
-    return [pscustomobject]@{ CliPath = $cliPath; DescriptorPath = $descriptorPath }
+    return [pscustomobject]@{ CliPath = $cliPath; DescriptorPath = $descriptorPath; PathAdded = $pathAdded }
 }
 
 function Invoke-RuleVaultBootstrap([string] $CliPath, [string] $ConfigRoot, [string] $Adapter, [bool] $All, [string] $HomeRoot = '') {
@@ -638,6 +706,13 @@ if ((($applyResult | Out-String | ConvertFrom-Json).code) -eq 'OK') {
     Write-Host "$vaultRootFull" -ForegroundColor White
     Write-Host " 🔒 CLI:   " -NoNewline -ForegroundColor Gray
     Write-Host "$($cliInstall.CliPath)" -ForegroundColor White
+    if ($cliInstall.PathAdded) {
+        Write-Host " ⌨ Command: " -NoNewline -ForegroundColor Gray
+        Write-Host 'rulevault (open a new terminal before using it)' -ForegroundColor White
+    } else {
+        Write-Host " ⌨ Command: " -NoNewline -ForegroundColor Gray
+        Write-Host 'rulevault' -ForegroundColor White
+    }
     Write-Host " 🗒 Agent descriptor: " -NoNewline -ForegroundColor Gray
     Write-Host "$($cliInstall.DescriptorPath)" -ForegroundColor DarkGray
     Write-Host "====================================================" -ForegroundColor Green

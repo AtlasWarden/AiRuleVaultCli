@@ -2,7 +2,7 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <RootNamespace>RuleVault.Cli</RootNamespace>
-    <AssemblyName>rv</AssemblyName>
+    <AssemblyName>rulevault</AssemblyName>
     <ApplicationIcon />
     <PublishSingleFile Condition="'$(PublishSingleFile)' == ''">true</PublishSingleFile>
     <SelfContained>false</SelfContained>

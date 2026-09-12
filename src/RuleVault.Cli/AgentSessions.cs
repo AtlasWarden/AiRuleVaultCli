@@ -26,8 +26,8 @@ public sealed record AgentDailyResult(DailyInspection Daily, string BasisHash, i
 public sealed record AgentLinksResult(InboundLinkInfo Links, string BasisHash, int ReadTokens, bool RequiresAdditionalRefresh, IReadOnlyList<string> StalePaths);
 public sealed record AgentMutationResult(IReadOnlyList<string> ChangedPaths, IReadOnlyList<string> InvalidatedPaths);
 public sealed record AgentUsageOverview(int ActiveSessions, int StaleSessions, long ReadTokens, long WriteTokens, long TotalTokens, int TrackedFiles);
-public sealed record AgentFileUsage(string RelativePath, long ReadTokens, long WriteTokens, int ReadCount, int WriteCount, IReadOnlyList<AgentFileReader> Readers);
-public sealed record AgentFileReader(string SessionId, string FriendlyName, int ReadCount, int WriteCount, long ReadTokens, long WriteTokens);
+public sealed record AgentFileUsage(string RelativePath, bool InCurrentContext, long ReadTokens, long WriteTokens, int ReadCount, int WriteCount, IReadOnlyList<AgentFileReader> Readers);
+public sealed record AgentFileReader(string SessionId, string FriendlyName, bool InCurrentContext, int ReadCount, int WriteCount, long ReadTokens, long WriteTokens);
 public sealed record AgentSessionSummary(string SessionId, string FriendlyName, string AgentKind, string FolderContext, string Project, DateTimeOffset LastSeenAtUtc, string Freshness, string StartupStatus, string? BasisHash, int BasisFileCount, long ReadTokens, long WriteTokens);
 public sealed record AgentUsageReport(AgentUsageOverview Overview, IReadOnlyList<AgentSessionSummary> Sessions, IReadOnlyList<AgentFileUsage> Files);
 public sealed record AgentViewDiagnostic(
@@ -499,9 +499,19 @@ public static class AgentSessions
         }, cancellationToken);
     }
 
-    public static async Task<AgentUsageReport> UsageAsync(string configRoot, string? sessionId, CancellationToken cancellationToken = default)
+    public static async Task<AgentUsageReport> UsageAsync(string configRoot, string? agentIdOrName, CancellationToken cancellationToken = default)
     {
+        if (!string.IsNullOrWhiteSpace(agentIdOrName))
+        {
+            ValidateIdentity(agentIdOrName, "agent ID or name");
+        }
+
         var state = await LoadAllAsync(configRoot, cancellationToken);
+        if (state.Sessions.Count == 0)
+        {
+            return new AgentUsageReport(new AgentUsageOverview(0, 0, 0, 0, 0, 0), [], []);
+        }
+
         var selected = await ResolveSelectedVaultAsync(configRoot, cancellationToken);
         await Parallel.ForEachAsync(state.Sessions, cancellationToken, async (session, token) =>
         {
@@ -510,16 +520,28 @@ public static class AgentSessions
         });
 
         state.RemoveExpired(DateTimeOffset.UtcNow);
-        var selectedSessions = string.IsNullOrWhiteSpace(sessionId) ? state.Sessions : state.Sessions.Where(item => item.SessionId.Equals(sessionId, StringComparison.Ordinal)).ToList();
-        if (!string.IsNullOrWhiteSpace(sessionId) && selectedSessions.Count == 0)
+        List<AgentSessionState> selectedSessions;
+        if (string.IsNullOrWhiteSpace(agentIdOrName))
         {
-            throw new AgentSessionException("AGENT_SESSION_NOT_FOUND", "No registered agent session has that session id.");
+            selectedSessions = state.Sessions;
+        }
+        else
+        {
+            var idMatch = state.Sessions.SingleOrDefault(item => item.SessionId.Equals(agentIdOrName, StringComparison.Ordinal));
+            selectedSessions = idMatch is not null
+                ? [idMatch]
+                : state.Sessions.Where(item => item.FriendlyName.Equals(agentIdOrName, StringComparison.OrdinalIgnoreCase)).ToList();
+        }
+
+        if (!string.IsNullOrWhiteSpace(agentIdOrName) && selectedSessions.Count == 0)
+        {
+            throw new AgentSessionException("AGENT_SESSION_NOT_FOUND", "No registered agent has that ID or name. Run 'rulevault agent status' to see the available agents.");
         }
 
         var summaries = selectedSessions.OrderBy(item => item.FriendlyName, StringComparer.Ordinal).Select(item => new AgentSessionSummary(item.SessionId, item.FriendlyName, item.AgentKind, item.FolderContext, item.Project, item.LastSeenAtUtc, AgentSessionDocument.Freshness(item), item.StartupCompletedAtUtc is null ? "required" : "complete", AgentSessionDocument.BasisHashOrNull(item), AgentSessionDocument.BasisFileCount(item), item.ReadTokens, item.WriteTokens)).ToArray();
         var files = selectedSessions.SelectMany(session => session.Files.Select(file => new { session, file }))
             .GroupBy(item => item.file.RelativePath, StringComparer.Ordinal).OrderBy(group => group.Key, StringComparer.Ordinal)
-            .Select(group => new AgentFileUsage(group.Key, group.Sum(item => item.file.ReadTokens), group.Sum(item => item.file.WriteTokens), group.Sum(item => item.file.ReadCount), group.Sum(item => item.file.WriteCount), group.OrderBy(item => item.session.FriendlyName, StringComparer.Ordinal).Select(item => new AgentFileReader(item.session.SessionId, item.session.FriendlyName, item.file.ReadCount, item.file.WriteCount, item.file.ReadTokens, item.file.WriteTokens)).ToArray())).ToArray();
+            .Select(group => new AgentFileUsage(group.Key, group.Any(item => item.file.InBasis), group.Sum(item => item.file.ReadTokens), group.Sum(item => item.file.WriteTokens), group.Sum(item => item.file.ReadCount), group.Sum(item => item.file.WriteCount), group.OrderBy(item => item.session.FriendlyName, StringComparer.Ordinal).Select(item => new AgentFileReader(item.session.SessionId, item.session.FriendlyName, item.file.InBasis, item.file.ReadCount, item.file.WriteCount, item.file.ReadTokens, item.file.WriteTokens)).ToArray())).ToArray();
         return new AgentUsageReport(new AgentUsageOverview(summaries.Length, summaries.Count(item => item.Freshness == "stale"), summaries.Sum(item => item.ReadTokens), summaries.Sum(item => item.WriteTokens), summaries.Sum(item => item.ReadTokens + item.WriteTokens), files.Length), summaries, files);
     }
 
@@ -668,7 +690,7 @@ public static class AgentSessions
 
             if (!string.Equals(inspection.VaultId, registryId.GetString(), StringComparison.OrdinalIgnoreCase) || !string.Equals(inspection.ContentIntegrityCanonicalSha256, registryHash.GetString(), StringComparison.OrdinalIgnoreCase))
             {
-                throw new AgentSessionException("VAULT_REGISTRY_INTEGRITY_MISMATCH", "Rule Vault found a mismatch between its saved protected-file fingerprint and the files on disk. Run 'rv agent doctor --format json' from this command host to distinguish a stale host view from a real mismatch; do not bypass this check.");
+                throw new AgentSessionException("VAULT_REGISTRY_INTEGRITY_MISMATCH", "Rule Vault found a mismatch between its saved protected-file fingerprint and the files on disk. Run 'rulevault agent doctor --format json' from this command host to distinguish a stale host view from a real mismatch; do not bypass this check.");
             }
 
             return new SelectedVault(configuredRoot, configRoot);

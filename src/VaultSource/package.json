@@ -12,7 +12,7 @@
     "posix": "install.sh"
   },
   "trust": {
-    "required": "A local package manifest must pin the raw SHA-256 of its selected rv artifact before the installer invokes it.",
+    "required": "A local package manifest must pin the raw SHA-256 of its selected rulevault artifact before the installer invokes it.",
     "remote_origin": null
   }
 }

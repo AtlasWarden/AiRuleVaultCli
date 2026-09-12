@@ -20,10 +20,13 @@ repair. It never changes an existing vault or agent bootstrap without approval.
 
 ## Use
 
-Run `rv --help` for human commands. Agents discover the installed executable from
+Run `rulevault help` for all commands, or `rulevault help <command>` for plain-language command details and examples. Agents discover the installed executable from
 `%LOCALAPPDATA%\AI-Rule-Vault\rule-vault-cli.json`, then call `agent capabilities`,
 `agent register`, and the required `agent context` startup command before other
 opaque agent operations.
+
+Run `rulevault agent status` to list registered agents. Add an agent ID or quoted
+friendly name to show that agent's details and files.
 
 Commands support `--format text`, `--format json`, or `--format table`, plus
 `--output-file <path>` for exports.

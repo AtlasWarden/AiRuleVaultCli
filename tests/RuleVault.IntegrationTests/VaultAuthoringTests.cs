@@ -16,6 +16,142 @@ public sealed class VaultAuthoringTests
     private static readonly string[] RootIndexRequirement = ["root-index"];
 
     [Fact]
+    public async Task HelpListsAvailableCommandsInPlainLanguage()
+    {
+        using var result = await Cli("help");
+        var data = result.RootElement.GetProperty("data");
+        Assert.Equal("rulevault", data.GetProperty("executable").GetString());
+        Assert.Contains(data.GetProperty("commands").EnumerateArray(), command =>
+            command.GetProperty("name").GetString() == "agent context" &&
+            command.GetProperty("summary").GetString()!.Contains("rules and project information", StringComparison.Ordinal) &&
+            command.GetProperty("group").GetString() == "Commands for AI agents");
+        Assert.Contains(data.GetProperty("commands").EnumerateArray(), command =>
+            command.GetProperty("name").GetString() == "agent status" &&
+            command.GetProperty("group").GetString() == "Commands for people");
+    }
+
+    [Fact]
+    public async Task CommandHelpDoesNotRunTheCommand()
+    {
+        using var result = await Cli("agent", "context", "--help");
+        Assert.Equal("OK", result.RootElement.GetProperty("code").GetString());
+        Assert.Equal("agent context", result.RootElement.GetProperty("data").GetProperty("topic").GetString());
+        Assert.StartsWith("rulevault agent context", result.RootElement.GetProperty("data").GetProperty("commands")[0].GetProperty("usage").GetString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UnknownHelpTopicReturnsAHelpfulError()
+    {
+        using var result = await CliExpectExit(2, "help", "not-a-command");
+        Assert.Equal("HELP_COMMAND_NOT_FOUND", result.RootElement.GetProperty("code").GetString());
+        Assert.Contains("rulevault help", result.RootElement.GetProperty("summary").GetString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task EveryCommandProducesStructuredAndReadableOutput()
+    {
+        var emptyRoot = Path.Combine(Path.GetTempPath(), "rulevault-command-output-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(emptyRoot);
+        var missingConfig = Path.Combine(emptyRoot, "missing-config");
+        var commands = new (string Name, string[] Arguments)[]
+        {
+            ("help", ["help"]),
+            ("version", ["version"]),
+            ("agent capabilities", ["agent", "capabilities"]),
+            ("capabilities", ["capabilities"]),
+            ("agent doctor", ["agent", "doctor", "--config-root", missingConfig]),
+            ("status", ["status", "--config-root", missingConfig]),
+            ("doctor", ["doctor", "--config-root", missingConfig]),
+            ("agent register", ["agent", "register"]),
+            ("agent context", ["agent", "context"]),
+            ("agent read", ["agent", "read"]),
+            ("agent write", ["agent", "write"]),
+            ("agent repository initialize", ["agent", "repository", "initialize"]),
+            ("agent repository read", ["agent", "repository", "read"]),
+            ("agent repository write", ["agent", "repository", "write"]),
+            ("agent project create", ["agent", "project", "create"]),
+            ("agent project inspect", ["agent", "project", "inspect"]),
+            ("agent daily inspect", ["agent", "daily", "inspect"]),
+            ("agent daily rollover", ["agent", "daily", "rollover"]),
+            ("agent links", ["agent", "links"]),
+            ("agent delete", ["agent", "delete"]),
+            ("agent status", ["agent", "status", "--config-root", missingConfig]),
+            ("agent usage", ["agent", "usage", "--config-root", missingConfig]),
+            ("agent list", ["agent", "list", "--config-root", missingConfig]),
+            ("agent clear", ["agent", "clear"]),
+            ("vault inspect", ["vault", "inspect"]),
+            ("vault status", ["vault", "status"]),
+            ("vault identity", ["vault", "identity"]),
+            ("vault read", ["vault", "read"]),
+            ("vault write", ["vault", "write"]),
+            ("vault links", ["vault", "links"]),
+            ("vault delete", ["vault", "delete"]),
+            ("context", ["context"]),
+            ("project create", ["project", "create"]),
+            ("daily inspect", ["daily", "inspect"]),
+            ("daily rollover", ["daily", "rollover"]),
+            ("repository agents read", ["repository", "agents", "read"]),
+            ("repository agents write", ["repository", "agents", "write"]),
+            ("agents discover", ["agents", "discover", "--home-root", emptyRoot]),
+            ("agents bootstrap discover", ["agents", "bootstrap", "discover", "--home-root", emptyRoot]),
+            ("agents bootstrap apply", ["agents", "bootstrap", "apply"]),
+            ("agents write", ["agents", "write"]),
+            ("install plan", ["install", "plan"]),
+            ("update plan", ["update", "plan"]),
+            ("repair plan", ["repair", "plan"]),
+            ("plan show", ["plan", "show"]),
+            ("plan apply", ["plan", "apply"])
+        };
+
+        var failures = new List<string>();
+        try
+        {
+            foreach (var command in commands)
+            {
+                var textResult = await RunCli(command.Arguments, forceJson: false);
+                if (string.IsNullOrWhiteSpace(textResult.Output) || textResult.Output.TrimStart().StartsWith('{') ||
+                    (textResult.Output + textResult.Error).Contains("Unhandled exception", StringComparison.OrdinalIgnoreCase))
+                {
+                    failures.Add($"{command.Name}: default text was empty, raw JSON, or unhandled ({textResult.ExitCode}).");
+                }
+
+                var jsonResult = await RunCli([.. command.Arguments, "--format", "json"], forceJson: false);
+                try
+                {
+                    using var json = JsonDocument.Parse(jsonResult.Output);
+                    if (string.IsNullOrWhiteSpace(json.RootElement.GetProperty("code").GetString()))
+                    {
+                        failures.Add($"{command.Name}: JSON had no response code.");
+                    }
+                }
+                catch (Exception exception)
+                {
+                    failures.Add($"{command.Name}: invalid JSON ({exception.Message}).");
+                }
+
+                var tableResult = await RunCli([.. command.Arguments, "--format", "table"], forceJson: false);
+                if (!tableResult.Output.Contains('|', StringComparison.Ordinal) || !tableResult.Output.Contains('+', StringComparison.Ordinal) ||
+                    (tableResult.Output + tableResult.Error).Contains("Unhandled exception", StringComparison.OrdinalIgnoreCase))
+                {
+                    failures.Add($"{command.Name}: table output was missing or unhandled ({tableResult.ExitCode}).");
+                }
+            }
+
+            var version = await RunCli(["version"], forceJson: false);
+            if (!version.Output.Contains("CLI Version: 0.1.0", StringComparison.Ordinal))
+            {
+                failures.Add("version: default text did not contain the actual CLI version.");
+            }
+        }
+        finally
+        {
+            Directory.Delete(emptyRoot);
+        }
+
+        Assert.True(failures.Count == 0, string.Join(Environment.NewLine, failures));
+    }
+
+    [Fact]
     public async Task TwoHundredAgentsRegisterAndLoadContextWithoutAGlobalSessionLock()
     {
         using var fixture = await Fixture.CreateAsync(TestContext.Current.CancellationToken);
@@ -402,7 +538,25 @@ public sealed class VaultAuthoringTests
             Assert.Equal("index.md", file.GetProperty("relative_path").GetString());
             Assert.True(file.GetProperty("read_tokens").GetInt64() > 0);
             Assert.True(file.GetProperty("write_tokens").GetInt64() > 0);
+            Assert.True(file.GetProperty("in_current_context").GetBoolean());
             Assert.DoesNotContain(fixture.Vault, detail.RootElement.GetRawText(), StringComparison.OrdinalIgnoreCase);
+
+            using var byName = await Cli("agent", "status", "Reviewer", "--config-root", fixture.Config);
+            Assert.Single(byName.RootElement.GetProperty("data").GetProperty("sessions").EnumerateArray());
+            Assert.Equal("Reviewer", byName.RootElement.GetProperty("data").GetProperty("sessions")[0].GetProperty("friendly_name").GetString());
+            Assert.Contains(byName.RootElement.GetProperty("data").GetProperty("files").EnumerateArray(), item => item.GetProperty("relative_path").GetString() == "index.md");
+
+            var plainList = await RunCli(["agent", "status", "--config-root", fixture.Config], forceJson: false);
+            Assert.Equal(0, plainList.ExitCode);
+            Assert.Contains("Registered agents", plainList.Output, StringComparison.Ordinal);
+            Assert.Contains("Author", plainList.Output, StringComparison.Ordinal);
+            Assert.Contains("rulevault agent status <agent-id-or-name>", plainList.Output, StringComparison.Ordinal);
+
+            var plainAgent = await RunCli(["agent", "status", "Reviewer", "--config-root", fixture.Config], forceJson: false);
+            Assert.Equal(0, plainAgent.ExitCode);
+            Assert.Contains("Agent details", plainAgent.Output, StringComparison.Ordinal);
+            Assert.Contains("Files used", plainAgent.Output, StringComparison.Ordinal);
+            Assert.Contains("index.md", plainAgent.Output, StringComparison.Ordinal);
         }
         finally { fixture.Dispose(); }
     }
@@ -628,18 +782,22 @@ public sealed class VaultAuthoringTests
         return JsonDocument.Parse(execution.Output);
     }
 
-    private static async Task<(int ExitCode, string Output, string Error)> RunCli(string[] arguments)
+    private static async Task<(int ExitCode, string Output, string Error)> RunCli(string[] arguments, bool forceJson = true)
     {
-        var project = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "src", "RuleVault.Cli", "RuleVault.Cli.csproj"));
         var configuration = new DirectoryInfo(AppContext.BaseDirectory).Parent?.Name ?? "Debug";
+        var cli = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "src", "RuleVault.Cli", "bin", configuration, "net10.0", "rulevault.dll"));
+        Assert.True(File.Exists(cli), $"Built CLI was not found: {cli}");
         using var process = new System.Diagnostics.Process { StartInfo = new System.Diagnostics.ProcessStartInfo("dotnet") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true } };
-        process.StartInfo.ArgumentList.Add("run"); process.StartInfo.ArgumentList.Add("--project"); process.StartInfo.ArgumentList.Add(project); process.StartInfo.ArgumentList.Add("-c"); process.StartInfo.ArgumentList.Add(configuration); process.StartInfo.ArgumentList.Add("--no-build"); process.StartInfo.ArgumentList.Add("--no-launch-profile"); process.StartInfo.ArgumentList.Add("--");
+        process.StartInfo.ArgumentList.Add(cli);
         foreach (var argument in arguments)
         {
             process.StartInfo.ArgumentList.Add(argument);
         }
 
-        process.StartInfo.ArgumentList.Add("--format"); process.StartInfo.ArgumentList.Add("json");
+        if (forceJson)
+        {
+            process.StartInfo.ArgumentList.Add("--format"); process.StartInfo.ArgumentList.Add("json");
+        }
         process.Start(); var output = await process.StandardOutput.ReadToEndAsync(TestContext.Current.CancellationToken); var error = await process.StandardError.ReadToEndAsync(TestContext.Current.CancellationToken); await process.WaitForExitAsync(TestContext.Current.CancellationToken);
         return (process.ExitCode, output, error);
     }

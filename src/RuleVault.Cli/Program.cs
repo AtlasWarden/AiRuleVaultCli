@@ -107,7 +107,7 @@ internal sealed class CliInvocation
         {
             0 => string.Empty,
             1 => _positionals[0],
-            _ when _positionals.Length >= 3 && ((_positionals[0] == "repository" && _positionals[1] == "agents") || _positionals[0] == "agent" || (_positionals[0] == "agents" && _positionals[1] == "bootstrap")) => string.Join(' ', _positionals.Take(3)),
+            _ when _positionals.Length >= 3 && ((_positionals[0] == "repository" && _positionals[1] == "agents") || (_positionals[0] == "agent" && _positionals[1] is "repository" or "project" or "daily") || (_positionals[0] == "agents" && _positionals[1] == "bootstrap")) => string.Join(' ', _positionals.Take(3)),
             _ => string.Join(' ', _positionals.Take(2))
         };
         var requestedFormat = Option("format") ?? "text";
@@ -122,9 +122,13 @@ internal sealed class CliInvocation
             return Write("command", "failed", "INVALID_OPTIONS", "Use either --format json or --events-json, not both.", null, 2, json);
         }
 
-        if (_positionals.Length == 0 || command is "help" or "--help" or "-h")
+        var helpRequested = _positionals.Length == 0 || Has("help") || _positionals.Any(value => value is "--help" or "-h") || _positionals[0] == "help";
+        if (helpRequested)
         {
-            return WriteHelp(json);
+            var helpTopic = _positionals.Length == 0
+                ? null
+                : string.Join(' ', _positionals.Where((value, index) => index > 0 || _positionals[0] != "help").Where(value => value is not "--help" and not "-h"));
+            return WriteHelp(json, string.IsNullOrWhiteSpace(helpTopic) ? null : helpTopic);
         }
 
         if (command is "version" or "--version")
@@ -199,7 +203,7 @@ internal sealed class CliInvocation
 
         if (command is "agent usage" or "agent status" or "agent list")
         {
-            return await ShowAgentUsageAsync(json);
+            return await ShowAgentUsageAsync(command, json);
         }
 
         if (command == "agent clear")
@@ -347,7 +351,7 @@ internal sealed class CliInvocation
             return Write(command, "unavailable", "COMMAND_UNAVAILABLE", "This command is not available in this build. Use the documented supported alternative; no partial action was attempted.", UnavailableCommand(command), 7, json);
         }
 
-        return Write(command, "failed", "UNKNOWN_COMMAND", "Unknown command. Run rv help for the supported command set.", null, 2, json);
+        return Write(command, "failed", "UNKNOWN_COMMAND", "Unknown command. Run rulevault help for the supported command set.", null, 2, json);
     }
 
     private async Task<int> CreateInstallPlanAsync(bool json)
@@ -686,7 +690,11 @@ internal sealed class CliInvocation
         {
             return Write("agent doctor", "blocked", exception.Code, exception.Message, null, 4, json);
         }
-        catch (Exception exception) when (exception is SafePathException or StorageFormatException or FileNotFoundException or UnauthorizedAccessException or IOException)
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException or System.ComponentModel.Win32Exception)
+        {
+            return Write("agent doctor", "blocked", "RULE_VAULT_NOT_FOUND", "Rule Vault could not find its settings or vault files. Run the installer, or check the settings location you selected.", null, 4, json);
+        }
+        catch (Exception exception) when (exception is SafePathException or StorageFormatException or FileNotFoundException or DirectoryNotFoundException or UnauthorizedAccessException or IOException or System.ComponentModel.Win32Exception)
         {
             return Write("agent doctor", "blocked", "AGENT_VIEW_DIAGNOSTIC_FAILED", exception.Message, null, 4, json);
         }
@@ -890,17 +898,48 @@ internal sealed class CliInvocation
         }
     }
 
-    private async Task<int> ShowAgentUsageAsync(bool json)
+    private async Task<int> ShowAgentUsageAsync(string command, bool json)
     {
         try
         {
-            var result = await AgentSessions.UsageAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), Option("session-id"));
-            var detail = string.Equals(Option("detail"), "files", StringComparison.OrdinalIgnoreCase) || string.Equals(Option("detail"), "full", StringComparison.OrdinalIgnoreCase);
+            var selectors = new[]
+            {
+                Option("agent"),
+                Option("session-id"),
+                _positionals.Length > 2 ? string.Join(' ', _positionals.Skip(2)) : null
+            }.Where(value => !string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            if (selectors.Length > 1)
+            {
+                return Write(command, "failed", "AGENT_SELECTION_AMBIGUOUS", "Choose one agent by position, --agent, or --session-id.", null, 2, json);
+            }
+
+            var selector = selectors.SingleOrDefault();
+            var detailValue = (Option("detail") ?? "summary").ToLowerInvariant();
+            if (detailValue is not ("summary" or "files" or "full"))
+            {
+                return Write(command, "failed", "AGENT_DETAIL_INVALID", "Use --detail summary, files, or full.", null, 2, json);
+            }
+
+            var result = await AgentSessions.UsageAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), selector);
+            var detail = selector is not null || detailValue is "files" or "full";
             object data = detail ? result : new { overview = result.Overview, sessions = result.Sessions };
-            return Write("agent usage", "ok", "OK", detail ? "Reported aggregate, per-session, and per-file token/access usage." : "Reported compact aggregate and per-session token usage. Use --detail files for per-file readers and access counts.", data, 0, json);
+            var summary = selector is null
+                ? $"Found {result.Sessions.Count} registered agent session(s)."
+                : $"Found {result.Sessions.Count} registered agent session(s) matching '{selector}'.";
+            if (!json && string.Equals(Option("format") ?? "text", "text", StringComparison.OrdinalIgnoreCase))
+            {
+                return WriteRendered(RenderAgentStatusText(result, selector, detail, detailValue == "full"), 0);
+            }
+
+            if (!json && string.Equals(Option("format"), "table", StringComparison.OrdinalIgnoreCase))
+            {
+                return WriteRendered(RenderAgentStatusTable(result, selector, detail), 0);
+            }
+
+            return Write(command, "ok", "OK", summary, data, 0, json);
         }
-        catch (AgentSessionException exception) { return Write("agent usage", "blocked", exception.Code, exception.Message, null, 4, json); }
-        catch (Exception exception) when (exception is SafePathException or StorageFormatException or FileNotFoundException) { return Write("agent usage", "blocked", "AGENT_USAGE_FAILED", exception.Message, null, 4, json); }
+        catch (AgentSessionException exception) { return Write(command, "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (Exception exception) when (exception is SafePathException or StorageFormatException or FileNotFoundException or DirectoryNotFoundException or UnauthorizedAccessException or IOException or System.ComponentModel.Win32Exception) { return Write(command, "blocked", "AGENT_USAGE_FAILED", exception.Message, null, 4, json); }
     }
 
     private async Task<int> ClearAgentSessionAsync(bool json)
@@ -1087,13 +1126,19 @@ internal sealed class CliInvocation
             ?? throw new InvalidDataException("Plan JSON could not be parsed.");
     }
 
-    private int WriteHelp(bool json)
+    private int WriteHelp(bool json, string? topic)
     {
-        var text = "Rule Vault CLI\n\n" +
-            "Agent workflow: agent capabilities, agent doctor, agent register, required agent context startup, agent read/write, agent repository read/write, agent project create, agent daily inspect/rollover, agent links/delete, and agent status/clear. Agent commands resolve the selected vault internally and never disclose its location.\n\n" +
-            "Administrative workflow: capabilities, version, status, doctor, vault inspect/read/write/links/delete, project create, daily inspect/rollover, context, agents discover/write, agents bootstrap discover/apply, install plan, update plan, repair plan, plan show, plan apply.\n" +
-            "Use --format text, json, or table. Use --output-file <path> to export the selected representation. Agent reads return a new opaque basis hash; stale sessions must refresh before writing.";
-        return Write("help", "ok", "OK", text, null, 0, json);
+        var document = topic is null ? CliHelp.Root() : CliHelp.Find(topic);
+        if (document is null)
+        {
+            return Write("help", "failed", "HELP_COMMAND_NOT_FOUND", $"No help topic matches '{topic}'. Run rulevault help to list available commands.", new { topic }, 2, json);
+        }
+
+        var structured = json || string.Equals(Option("format"), "table", StringComparison.OrdinalIgnoreCase);
+        var summary = structured
+            ? topic is null ? "Rule Vault command help." : $"Help for '{document.Topic}'."
+            : CliHelp.Render(document);
+        return Write(topic is null ? "help" : $"help {document.Topic}", "ok", "OK", summary, structured ? document : null, 0, json);
     }
 
     private int WriteRepositoryPathFailure(string command, SafePathException exception, bool json)
@@ -1127,12 +1172,18 @@ internal sealed class CliInvocation
                 rendered += $"Context SHA-256: {context.Packet.BodySha256}; delivery: {context.Delivery}" + Environment.NewLine;
                 rendered += context.Packet.Body + Environment.NewLine;
             }
-            else if (data is not null && Has("verbose"))
+            else if (data is not null)
             {
-                rendered += JsonSerializer.Serialize(data, JsonOptions) + Environment.NewLine;
+                rendered += RenderTextData(data);
             }
         }
 
+        var humanReadable = !json && !string.Equals(Option("format"), "table", StringComparison.OrdinalIgnoreCase);
+        return WriteRendered(rendered, exitCode, humanReadable);
+    }
+
+    private int WriteRendered(string rendered, int exitCode, bool humanReadable = true)
+    {
         var outputFile = Option("output-file");
         if (!string.IsNullOrWhiteSpace(outputFile))
         {
@@ -1146,9 +1197,214 @@ internal sealed class CliInvocation
                 return 2;
             }
         }
-        Console.Out.Write(rendered);
+        if (humanReadable && !Console.IsOutputRedirected && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("NO_COLOR")))
+        {
+            WriteColoredText(rendered, exitCode);
+        }
+        else
+        {
+            Console.Out.Write(rendered);
+        }
         return exitCode;
     }
+
+    private static void WriteColoredText(string rendered, int exitCode)
+    {
+        var original = Console.ForegroundColor;
+        var helpDocument = rendered.StartsWith("Rule Vault CLI", StringComparison.Ordinal);
+        try
+        {
+            using var reader = new StringReader(rendered);
+            string? line;
+            var firstLine = true;
+            while ((line = reader.ReadLine()) is not null)
+            {
+                if (firstLine && exitCode != 0)
+                {
+                    WriteColor(line, exitCode >= 4 ? ConsoleColor.Red : ConsoleColor.Yellow);
+                }
+                else if (line.Equals("Rule Vault CLI", StringComparison.Ordinal) ||
+                    line.Equals("Registered agents", StringComparison.Ordinal) ||
+                    line.Equals("Agent details", StringComparison.Ordinal) ||
+                    line.Equals("Files used", StringComparison.Ordinal) ||
+                    line.EndsWith(':'))
+                {
+                    WriteColor(line, ConsoleColor.Cyan);
+                }
+                else if (firstLine)
+                {
+                    WriteColor(line, ConsoleColor.Green);
+                }
+                else if (line.TrimStart().StartsWith("rulevault ", StringComparison.OrdinalIgnoreCase))
+                {
+                    WriteColor(line, ConsoleColor.Green);
+                }
+                else if (helpDocument && line.StartsWith("  ", StringComparison.Ordinal) &&
+                    line.TrimStart() is { Length: > 0 } helpText &&
+                    !helpText.StartsWith("--", StringComparison.Ordinal) && char.IsLower(helpText[0]))
+                {
+                    WriteColor(line, ConsoleColor.Green);
+                }
+                else if (helpDocument && line.StartsWith("  ", StringComparison.Ordinal) &&
+                    !line.StartsWith("    ", StringComparison.Ordinal) &&
+                    line.TrimStart() is { Length: > 0 } groupText && char.IsUpper(groupText[0]))
+                {
+                    WriteColor(line, ConsoleColor.Cyan);
+                }
+                else if (line.Length > 0 && line.All(character => character is '-' or '=' or ' '))
+                {
+                    WriteColor(line, ConsoleColor.DarkGray);
+                }
+                else if (TryWriteLabeledLine(line, original))
+                {
+                    // The label and value were written separately.
+                }
+                else
+                {
+                    Console.ForegroundColor = original;
+                    Console.WriteLine(line);
+                }
+
+                firstLine = false;
+            }
+        }
+        finally
+        {
+            Console.ForegroundColor = original;
+        }
+    }
+
+    private static bool TryWriteLabeledLine(string line, ConsoleColor original)
+    {
+        var colon = line.IndexOf(':');
+        if (colon <= 0 || colon > 24 || line[..colon].Any(character => character is '\\' or '/'))
+        {
+            return false;
+        }
+
+        var label = line[..(colon + 1)];
+        var value = line[(colon + 1)..];
+        Console.ForegroundColor = ConsoleColor.DarkCyan;
+        Console.Write(label);
+        Console.ForegroundColor = original;
+        Console.WriteLine(value);
+        return true;
+    }
+
+    private static void WriteColor(string text, ConsoleColor color)
+    {
+        Console.ForegroundColor = color;
+        Console.WriteLine(text);
+    }
+
+    private static string RenderAgentStatusText(AgentUsageReport report, string? selector, bool includeFiles, bool full)
+    {
+        var builder = new System.Text.StringBuilder();
+        builder.AppendLine(selector is null ? "Registered agents" : "Agent details");
+        builder.AppendLine(new string('-', selector is null ? 17 : 13));
+        builder.Append("Sessions: ").Append(report.Overview.ActiveSessions)
+            .Append("  |  Out of date: ").Append(report.Overview.StaleSessions)
+            .Append("  |  Files: ").AppendLine(report.Overview.TrackedFiles.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        builder.Append("Tokens read: ").Append(FormatNumber(report.Overview.ReadTokens))
+            .Append("  |  written: ").Append(FormatNumber(report.Overview.WriteTokens))
+            .Append("  |  total: ").AppendLine(FormatNumber(report.Overview.TotalTokens));
+
+        if (report.Sessions.Count == 0)
+        {
+            return builder.AppendLine().AppendLine("No registered agents were found.").ToString();
+        }
+
+        foreach (var session in report.Sessions)
+        {
+            builder.AppendLine().Append(session.FriendlyName).AppendLine();
+            builder.Append("  ID:          ").AppendLine(session.SessionId);
+            builder.Append("  Project:     ").AppendLine(session.Project);
+            builder.Append("  Folder:      ").AppendLine(session.FolderContext);
+            builder.Append("  Agent type:  ").AppendLine(session.AgentKind);
+            builder.Append("  Last active: ").AppendLine(session.LastSeenAtUtc.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'", System.Globalization.CultureInfo.InvariantCulture));
+            builder.Append("  Status:      ").Append(session.Freshness == "current" ? "Current" : "Out of date")
+                .Append("  |  startup ").AppendLine(session.StartupStatus);
+            builder.Append("  Files now:   ").AppendLine(session.BasisFileCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            builder.Append("  Tokens:      ").Append(FormatNumber(session.ReadTokens)).Append(" read  |  ")
+                .Append(FormatNumber(session.WriteTokens)).AppendLine(" written");
+            if (full && session.BasisHash is not null)
+            {
+                builder.Append("  Safety code: ").AppendLine(session.BasisHash);
+            }
+        }
+
+        if (includeFiles)
+        {
+            builder.AppendLine().AppendLine("Files used");
+            builder.AppendLine("----------");
+            if (report.Files.Count == 0)
+            {
+                builder.AppendLine("No file activity has been recorded for this selection.");
+            }
+            else
+            {
+                foreach (var file in report.Files)
+                {
+                    builder.Append(file.InCurrentContext ? "* " : "- ").AppendLine(file.RelativePath);
+                    builder.Append("  ").Append(file.InCurrentContext ? "In the current context" : "Earlier activity")
+                        .Append("  |  reads: ").Append(file.ReadCount)
+                        .Append("  |  writes: ").AppendLine(file.WriteCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    builder.Append("  Tokens: ").Append(FormatNumber(file.ReadTokens)).Append(" read  |  ")
+                        .Append(FormatNumber(file.WriteTokens)).AppendLine(" written");
+                    if (file.Readers.Count > 1)
+                    {
+                        builder.Append("  Agents: ").AppendLine(string.Join(", ", file.Readers.Select(reader => reader.FriendlyName + (reader.InCurrentContext ? " (current)" : string.Empty))));
+                    }
+                }
+            }
+        }
+        else
+        {
+            builder.AppendLine().AppendLine("To see an agent's files:");
+            builder.AppendLine("  rulevault agent status <agent-id-or-name>");
+        }
+
+        return builder.ToString();
+    }
+
+    private static string RenderAgentStatusTable(AgentUsageReport report, string? selector, bool includeFiles)
+    {
+        var builder = new System.Text.StringBuilder();
+        builder.Append(RenderGrid(
+            ["name", "id", "project", "state", "files", "read tokens", "written tokens"],
+            report.Sessions.Select(session => new[]
+            {
+                Compact(session.FriendlyName, 32),
+                Compact(session.SessionId, 36),
+                Compact(session.Project, 24),
+                session.Freshness == "current" ? "current" : "out of date",
+                session.BasisFileCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                FormatNumber(session.ReadTokens),
+                FormatNumber(session.WriteTokens)
+            }).ToArray()));
+
+        if (includeFiles)
+        {
+            builder.AppendLine(selector is null ? "Files used by these agents:" : "Files used by this agent:");
+            builder.Append(RenderGrid(
+                ["file", "current", "reads", "writes", "read tokens", "written tokens"],
+                report.Files.Select(file => new[]
+                {
+                    Compact(file.RelativePath, 72),
+                    file.InCurrentContext ? "yes" : "no",
+                    file.ReadCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    file.WriteCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    FormatNumber(file.ReadTokens),
+                    FormatNumber(file.WriteTokens)
+                }).ToArray()));
+        }
+
+        return builder.ToString();
+    }
+
+    private static string FormatNumber(long value) => value.ToString("N0", System.Globalization.CultureInfo.InvariantCulture);
+
+    private static string Compact(string value, int maximum) => value.Length <= maximum ? value : value[..(maximum - 3)] + "...";
 
     private static void WriteExport(string path, string content)
     {
@@ -1215,6 +1471,113 @@ internal sealed class CliInvocation
         }
 
         return builder.ToString();
+    }
+
+    private static string RenderTextData(object data)
+    {
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(data, JsonOptions));
+        var builder = new System.Text.StringBuilder();
+        AppendTextValue(builder, document.RootElement, 0, null, listItem: false);
+        return builder.ToString();
+    }
+
+    private static void AppendTextValue(System.Text.StringBuilder builder, JsonElement value, int indent, string? label, bool listItem)
+    {
+        var padding = new string(' ', indent);
+        var prefix = listItem ? "- " : string.Empty;
+        if (value.ValueKind == JsonValueKind.Object)
+        {
+            if (label is not null)
+            {
+                builder.Append(padding).Append(prefix).Append(ReadableLabel(label)).AppendLine(":");
+                indent += 2;
+                padding = new string(' ', indent);
+            }
+            else if (listItem)
+            {
+                builder.Append(padding).AppendLine("-");
+                indent += 2;
+                padding = new string(' ', indent);
+            }
+
+            foreach (var property in value.EnumerateObject())
+            {
+                AppendTextValue(builder, property.Value, indent, property.Name, listItem: false);
+            }
+            return;
+        }
+
+        if (value.ValueKind == JsonValueKind.Array)
+        {
+            if (label is not null)
+            {
+                builder.Append(padding).Append(prefix).Append(ReadableLabel(label)).AppendLine(":");
+                indent += 2;
+            }
+
+            var items = value.EnumerateArray().ToArray();
+            if (items.Length == 0)
+            {
+                builder.Append(' ', indent).AppendLine("(none)");
+                return;
+            }
+
+            foreach (var item in items)
+            {
+                AppendTextValue(builder, item, indent, null, listItem: true);
+            }
+            return;
+        }
+
+        var scalar = TextScalar(value);
+        if (scalar.Contains('\n'))
+        {
+            builder.Append(padding).Append(prefix);
+            if (label is not null) { builder.Append(ReadableLabel(label)).Append(':'); }
+            builder.AppendLine();
+            foreach (var line in scalar.Split('\n'))
+            {
+                builder.Append(' ', indent + 2).AppendLine(line);
+            }
+            return;
+        }
+
+        builder.Append(padding).Append(prefix);
+        if (label is not null) { builder.Append(ReadableLabel(label)).Append(": "); }
+        builder.AppendLine(scalar);
+    }
+
+    private static string TextScalar(JsonElement value)
+    {
+        var text = value.ValueKind switch
+        {
+            JsonValueKind.String => value.GetString() ?? string.Empty,
+            JsonValueKind.True => "yes",
+            JsonValueKind.False => "no",
+            JsonValueKind.Null or JsonValueKind.Undefined => "(none)",
+            _ => value.ToString()
+        };
+        return string.Concat(text.Select(character => character switch
+        {
+            '\r' => string.Empty,
+            '\n' or '\t' => character.ToString(),
+            _ when char.IsControl(character) => $"\\u{(int)character:X4}",
+            _ => character.ToString()
+        }));
+    }
+
+    private static string ReadableLabel(string value)
+    {
+        return string.Join(' ', value.Split('_', StringSplitOptions.RemoveEmptyEntries).Select(part => part.ToLowerInvariant() switch
+        {
+            "id" => "ID",
+            "ids" => "IDs",
+            "cli" => "CLI",
+            "sha256" => "SHA-256",
+            "utc" => "UTC",
+            "json" => "JSON",
+            _ => char.ToUpperInvariant(part[0]) + part[1..]
+        }));
     }
 
     private static string RenderArrayGrid(JsonElement values)
@@ -1455,7 +1818,7 @@ internal sealed class CliInvocation
     {
         schema_version = 1,
         contract = "Rule Vault CLI mediated authoring",
-        discovery = new { command = "rv capabilities --format json", descriptor = "AI-Rule-Vault/rule-vault-cli.json" },
+        discovery = new { command = "rulevault capabilities --format json", descriptor = "AI-Rule-Vault/rule-vault-cli.json" },
         operations = new object[]
         {
             new { name = "agent register", purpose = "Register an opaque agent session with its friendly name, thread/session identity, folder context, and project.", safety = "selected vault resolves internally; stale sessions expire after three days" },
@@ -1464,7 +1827,7 @@ internal sealed class CliInvocation
             new { name = "agent write", purpose = "Commit a mediated managed Markdown write for a registered, current session.", safety = "raw-hash precondition; stale-basis block; affected reader sessions are invalidated" },
             new { name = "agent repository read/write/initialize", purpose = "Use the registered workspace folder to initialize or access current-branch .agents Markdown/metadata without disclosing the private vault.", safety = "Git object and no-follow path gate on every access; strict parse plus applicable schema validation before verified authority; protected shared files are paired with their branch manifest" },
             new { name = "agent usage", purpose = "Show compact token totals or per-file read/write token and access details.", safety = "cl100k_base model-agnostic estimate; no vault-root disclosure" },
-            new { name = "agent status", purpose = "Alias for agent usage; show sessions with current or stale content bases.", safety = "does not disclose the private vault filesystem location" },
+            new { name = "agent status", purpose = "List registered agents, or select one by session ID or friendly name to show its details and files.", safety = "read-only; does not disclose the private vault filesystem location" },
             new { name = "agent clear", purpose = "Remove one registered session or all session records.", safety = "explicit session id or --all true" },
             new { name = "agents bootstrap discover/apply", purpose = "Show bounded known user-level agent instruction targets, then add/update one owned Rule Vault bootstrap per explicit selection.", safety = "does not execute agent software; absent directories are not created; ambiguous or conflicting legacy text is not overwritten" },
             new { name = "vault read", purpose = "Administrative: read a managed vault Markdown file and its optimistic-concurrency raw hash.", safety = "explicit vault root; no-follow path validation" },
@@ -1491,14 +1854,14 @@ internal sealed class CliInvocation
             required = true,
             sequence = new[]
             {
-                "Run rv agent capabilities --format json.",
-                "Run rv agent register --session-id <id> --name <friendly-name> --folder <workspace> --project <project> --format json.",
-                "Before any other agent operation, run rv agent context --session-id <id> --operation <read|edit|test|review|release|maintain-vault> --subjects <comma-separated> --paths <comma-separated repository-relative paths> --format json."
+                "Run rulevault agent capabilities --format json.",
+                "Run rulevault agent register --session-id <id> --name <friendly-name> --folder <workspace> --project <project> --format json.",
+                "Before any other agent operation, run rulevault agent context --session-id <id> --operation <read|edit|test|review|release|maintain-vault> --subjects <comma-separated> --paths <comma-separated repository-relative paths> --format json."
             },
             completion = "agent context verifies the protected route catalog, reads index.md, loads every applicable always route, adds project router/index/current-state/daily scope when present, and returns one complete packet plus a fresh basis hash",
             enforcement = "all other agent operations fail until context completes; write commands require edit/release/maintain-vault context, and project/daily/repository commands require their matching subject or .agents path scope"
         },
-        registration = new { command = "rv agent register --session-id <id> --name <friendly-name> --folder <workspace> --project <project> --format json", expires_after_inactive_days = 3, result = "returns startup_required and the required startup sequence" },
+        registration = new { command = "rulevault agent register --session-id <id> --name <friendly-name> --folder <workspace> --project <project> --format json", expires_after_inactive_days = 3, result = "returns startup_required and the required startup sequence" },
         operations = new object[]
         {
             new { name = "agent context", purpose = "Compile and return the complete deterministic task packet for the registered project, operation, subjects, and paths.", freshness = "Completes mandatory startup, tracks every returned source file, and returns the new opaque basis hash." },
@@ -1514,7 +1877,7 @@ internal sealed class CliInvocation
             new { name = "agent repository read", purpose = "Read .agents Markdown or deterministic JSON from the Git root resolved from the registered workspace.", freshness = "The no-follow ingest gate reruns on every access; verified-current-branch requires both strict parsing and applicable schema validation." },
             new { name = "agent repository write", purpose = "Write current-branch .agents Markdown without accepting a repository root from the agent.", freshness = "Requires a current session and raw precondition; protected shared Markdown updates the branch manifest in the same journaled operation." },
             new { name = "agent repository initialize", purpose = "Create a current-branch .agents candidate scaffold whose project_id matches the private project.", freshness = "Uses the registered workspace; creates protected indexes and manifest, then requires normal Git review/publication." },
-            new { name = "agent status", purpose = "Report compact session currency and token totals; use --detail files for per-file token/access and reader details.", freshness = "Automatically removes sessions inactive for more than three days." },
+            new { name = "agent status", purpose = "List agents in readable text by default; pass an agent ID or friendly name for its files, or request JSON/table output when needed.", freshness = "Automatically removes sessions inactive for more than three days." },
             new { name = "agent clear", purpose = "Clear one session or all session records.", freshness = "Requires explicit session id or --all true." }
         },
         context_delivery = new { body = "Packet body appears once; segments contain provenance only. Text format also delivers the complete body.", reuse = "Pass --known-context-sha256 with the last packet body_sha256 ONLY while that complete packet is retained in your current context. Omit after compaction, restart, lost context, or registration. An unchanged response has an empty body and retains the original packet hash and size metadata; all trust checks still run. Changed context is sent in full.", authoring = "Before vault or shared-memory writes, request subject memory or the applicable daily/continuity/handoff/project/repository/git scope; .agents paths also select repository procedures. Ordinary source-code edits do not need vault-authoring procedures.", daily = "Ordinary context omits only the trailing Sessions history of recognized daily notes; current handoff and preceding sections remain. Use a daily subject or --include-history true for the full active note." },

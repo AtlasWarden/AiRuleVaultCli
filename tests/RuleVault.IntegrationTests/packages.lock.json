@@ -157,6 +157,20 @@
           "xunit.v3.runner.common": "[4.0.0]"
         }
       },
+      "rulevault": {
+        "type": "Project",
+        "dependencies": {
+          "Microsoft.Bcl.Memory": "[9.0.20, )",
+          "Microsoft.ML.Tokenizers": "[2.0.0, )",
+          "Microsoft.ML.Tokenizers.Data.Cl100kBase": "[2.0.0, )",
+          "RuleVault.Agents": "[1.0.0, )",
+          "RuleVault.Core": "[1.0.0, )",
+          "RuleVault.Installation": "[1.0.0, )",
+          "RuleVault.Storage": "[1.0.0, )",
+          "Spectre.Console": "[0.57.2, )",
+          "System.CommandLine": "[2.0.12, )"
+        }
+      },
       "rulevault.agents": {
         "type": "Project",
         "dependencies": {
@@ -180,20 +194,6 @@
         "dependencies": {
           "RuleVault.Core": "[1.0.0, )",
           "YamlDotNet": "[18.1.0, )"
-        }
-      },
-      "rv": {
-        "type": "Project",
-        "dependencies": {
-          "Microsoft.Bcl.Memory": "[9.0.20, )",
-          "Microsoft.ML.Tokenizers": "[2.0.0, )",
-          "Microsoft.ML.Tokenizers.Data.Cl100kBase": "[2.0.0, )",
-          "RuleVault.Agents": "[1.0.0, )",
-          "RuleVault.Core": "[1.0.0, )",
-          "RuleVault.Installation": "[1.0.0, )",
-          "RuleVault.Storage": "[1.0.0, )",
-          "Spectre.Console": "[0.57.2, )",
-          "System.CommandLine": "[2.0.12, )"
         }
       },
       "Microsoft.Bcl.Memory": {
