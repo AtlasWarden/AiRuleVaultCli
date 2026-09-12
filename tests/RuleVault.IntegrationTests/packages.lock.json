@@ -142,6 +142,7 @@
       "rulevault.installation": {
         "type": "Project",
         "dependencies": {
+          "RuleVault.Agents": "[1.0.0, )",
           "RuleVault.Core": "[1.0.0, )",
           "RuleVault.Storage": "[1.0.0, )"
         }

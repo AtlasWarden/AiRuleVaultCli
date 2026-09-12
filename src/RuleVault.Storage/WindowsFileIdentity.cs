@@ -180,6 +180,9 @@ internal static class WindowsFileIdentity
         IntPtr extendedAttributes,
         uint extendedAttributesLength);
 
+    [DllImport("ntdll.dll")]
+    private static extern uint RtlNtStatusToDosError(int status);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct UnicodeString
     {
@@ -262,7 +265,13 @@ internal static class WindowsFileIdentity
             if (status < 0)
             {
                 handle?.Dispose();
-                throw new Win32Exception(status, $"Unable to open '{name}' beneath the trusted root.");
+                var error = unchecked((int)RtlNtStatusToDosError(status));
+                if (error is 2 or 3)
+                {
+                    throw new FileNotFoundException($"Unable to open '{name}' beneath the trusted root because the path does not exist.", name);
+                }
+
+                throw new Win32Exception(error, $"Unable to open '{name}' beneath the trusted root.");
             }
 
             return handle;

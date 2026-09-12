@@ -60,6 +60,24 @@
       "minLength": 1,
       "maxLength": 128
     },
+    "updated": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "load_policy": {
+      "enum": [
+        "always",
+        "conditional",
+        "historical"
+      ]
+    },
+    "integrity": {
+      "enum": [
+        "normal",
+        "protected"
+      ]
+    },
     "runtime_canary_id": {
       "type": "string",
       "pattern": "^RV-CANARY-[A-Za-z0-9-]{4,128}$"

@@ -97,6 +97,21 @@ public sealed class PlatformInventoryTests
         }
     }
 
+    [Fact]
+    public async Task MissingHandleRelativeFileUsesManagedFileNotFoundException()
+    {
+        var root = CreateTempDirectory();
+        try
+        {
+            await Assert.ThrowsAsync<FileNotFoundException>(() =>
+                TrustedFileSystem.ReadAllBytesAsync(root, "missing.md", SafePathProfile.PrivateConfig, cancellationToken: TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static string CreateTempDirectory()
     {
         var root = Path.Combine(Path.GetTempPath(), "RuleVaultCli", Guid.NewGuid().ToString("N"));

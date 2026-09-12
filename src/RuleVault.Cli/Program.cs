@@ -19,14 +19,39 @@ internal sealed record CliEnvelope(
     IReadOnlyList<string> NextActions);
 
 internal sealed record CliDiagnostic(string Code, string Severity, string Message);
+internal sealed record UnavailableOperation(string Command, string Reason, string Alternative);
 
 internal sealed class CliInvocation
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-        WriteIndented = true
+        WriteIndented = true,
+        UnmappedMemberHandling = System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow,
+        Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) }
     };
+    private static readonly UnavailableOperation[] UnavailableOperations =
+    [
+        new("setup", "interactive setup is owned by the signed installer", "run install.ps1 from a verified package"),
+        new("vault list", "agent-facing vault enumeration would disclose private locations", "use agent status or the installer for administrative selection"),
+        new("vault select", "agent-facing vault selection would expose private configuration", "use the installer or edit a reviewed administrative plan"),
+        new("migrate plan", "general source-layout migration is not implemented as a standalone command", "run update plan; it performs bounded additive conversion and archives ambiguous legacy data"),
+        new("recover list", "journal recovery inspection has no stable public response contract", "inspect retained journals and archives administratively"),
+        new("recover resume", "automatic journal replay is unsafe when a partial write is ambiguous", "review retained evidence and create a new exact-digest repair or update plan"),
+        new("rollback plan", "general rollback planning is not implemented", "use restore-package repair or restore reviewed archived content through mediated writes"),
+        new("check", "there is no separate check command", "use agent context for task-scoped validation or vault inspect for explicit administrative inspection"),
+        new("memory plan", "standalone memory planning is not implemented", "use agent write after loading task context and applying the vault classification rules"),
+        new("changes plan", "standalone change planning is not implemented", "use agent links/read and an exact-hash mediated write"),
+        new("agents list", "legacy adapter listing was replaced by opaque session status", "use agent status and agents bootstrap discover"),
+        new("agents plan", "legacy adapter planning was replaced by explicit bootstrap selection", "use agents bootstrap discover, then agents bootstrap apply"),
+        new("agents probe", "executing or probing agent software is outside the safe adapter boundary", "use agents bootstrap discover, which performs bounded non-executing discovery"),
+        new("run", "Rule Vault is a short-lived CLI and does not host a long-running agent process", "use agent context at task start, then opaque agent commands"),
+        new("package verify", "package verification is performed by the installer before CLI execution", "run the verified installer package workflow"),
+        new("self-update plan", "self-update is owned by the installer update workflow", "run install.ps1 and approve its reviewed update plan"),
+        new("uninstall plan", "an uninstall planner is not implemented", "preserve the vault and remove only reviewed installer-owned files manually"),
+        new("cleanup plan", "general cleanup could remove user-owned data and is not implemented", "review archive/session retention and clear only explicit agent session records"),
+        new("context explain", "a separate explanation command is not implemented", "use agent context; its segments identify every included route")
+    ];
 
     private readonly string[] _positionals;
     private readonly IReadOnlyDictionary<string, string?> _options;
@@ -132,6 +157,11 @@ internal sealed class CliInvocation
             return await RegisterAgentSessionAsync(json);
         }
 
+        if (command == "agent context")
+        {
+            return await BuildAgentContextAsync(json);
+        }
+
         if (command == "agent read")
         {
             return await ReadAgentSessionAsync(json);
@@ -140,6 +170,21 @@ internal sealed class CliInvocation
         if (command == "agent write")
         {
             return await WriteAgentSessionAsync(json);
+        }
+
+        if (command == "agent repository read")
+        {
+            return await ReadAgentRepositoryAsync(json);
+        }
+
+        if (command == "agent repository write")
+        {
+            return await WriteAgentRepositoryAsync(json);
+        }
+
+        if (command == "agent repository initialize")
+        {
+            return await InitializeAgentRepositoryAsync(json);
         }
 
         if (command is "agent usage" or "agent status" or "agent list")
@@ -155,6 +200,11 @@ internal sealed class CliInvocation
         if (command == "agent project create")
         {
             return await CreateAgentProjectAsync(json);
+        }
+
+        if (command == "agent project inspect")
+        {
+            return await InspectAgentProjectAsync(json);
         }
 
         if (command == "agent daily inspect")
@@ -187,9 +237,19 @@ internal sealed class CliInvocation
             return await CreateUpdatePlanAsync(json);
         }
 
+        if (command == "repair plan")
+        {
+            return await CreateIntegrityRepairPlanAsync(json);
+        }
+
         if (command is "vault inspect" or "vault status")
         {
             return await InspectVaultAsync(command, json);
+        }
+
+        if (command == "vault identity")
+        {
+            return await InspectVaultIdentityAsync(json);
         }
 
         if (command == "vault read")
@@ -274,7 +334,7 @@ internal sealed class CliInvocation
 
         if (IsKnownCommand(command))
         {
-            return Write(command, "unsupported", "COMMAND_NOT_IMPLEMENTED", "This command is registered but its required trusted adapter or lifecycle capability is not available in this build.", null, 7, json);
+            return Write(command, "unavailable", "COMMAND_UNAVAILABLE", "This command is not available in this build. Use the documented supported alternative; no partial action was attempted.", UnavailableCommand(command), 7, json);
         }
 
         return Write(command, "failed", "UNKNOWN_COMMAND", "Unknown command. Run rv help for the supported command set.", null, 2, json);
@@ -322,7 +382,7 @@ internal sealed class CliInvocation
 
         try
         {
-            var inspection = await VaultInspector.InspectAsync(vaultRoot);
+            var inspection = await VaultInspector.InspectIdentityAsync(vaultRoot);
             if (!string.Equals(inspection.VaultId, vaultId, StringComparison.OrdinalIgnoreCase))
             {
                 return Write("update plan", "blocked", "VAULT_ID_MISMATCH", "Selected vault identity does not match --vault-id; no update plan was created.", null, 4, json);
@@ -342,7 +402,8 @@ internal sealed class CliInvocation
                 added_files = update.AddedFiles,
                 converted_vendor_files = update.ConvertedVendorFiles,
                 preserved_divergent_files = update.PreservedDivergentFiles,
-                archive_root = update.ArchiveRoot
+                archive_root = update.ArchiveRoot,
+                read_metrics = update.ReadMetrics
             }, 0, json);
         }
         catch (LifecycleException exception)
@@ -356,6 +417,67 @@ internal sealed class CliInvocation
         catch (Exception exception) when (exception is SafePathException or FileNotFoundException or UnauthorizedAccessException)
         {
             return Write("update plan", "blocked", "MALFORMED_INSTALLATION", $"{exception.Message} Existing bytes were preserved and no update plan was created.", null, 4, json);
+        }
+    }
+
+    private async Task<int> CreateIntegrityRepairPlanAsync(bool json)
+    {
+        var vaultRoot = Option("vault-root");
+        var configRoot = Option("config-root");
+        var vaultId = Option("vault-id");
+        var packageRoot = Option("package-root");
+        var strategy = Option("strategy");
+        if (string.IsNullOrWhiteSpace(vaultRoot) ||
+            string.IsNullOrWhiteSpace(configRoot) ||
+            string.IsNullOrWhiteSpace(vaultId) ||
+            string.IsNullOrWhiteSpace(packageRoot) ||
+            string.IsNullOrWhiteSpace(strategy))
+        {
+            return Write(
+                "repair plan",
+                "needs-input",
+                "INTEGRITY_REPAIR_INPUT_REQUIRED",
+                "Provide --vault-root, --config-root, --vault-id, --package-root, and --strategy restore-package|accept-current. No files are changed while planning.",
+                null,
+                3,
+                json);
+        }
+
+        try
+        {
+            var repair = await LifecyclePlanner.CreateIntegrityRepairAsync(
+                configRoot,
+                vaultRoot,
+                vaultId,
+                packageRoot,
+                strategy,
+                DateTimeOffset.UtcNow);
+            var output = Option("output");
+            if (!string.IsNullOrWhiteSpace(output))
+            {
+                await File.WriteAllTextAsync(output, JsonSerializer.Serialize(repair.Plan, JsonOptions));
+            }
+
+            return Write(
+                "repair plan",
+                "ok",
+                "OK",
+                "Created an explicit integrity-repair plan. Existing records and divergent bytes are archived before any accepted or restored state is committed.",
+                repair,
+                0,
+                json);
+        }
+        catch (LifecycleException exception)
+        {
+            return Write("repair plan", "blocked", exception.Code, exception.Message, null, 4, json);
+        }
+        catch (StorageFormatException exception)
+        {
+            return Write("repair plan", "blocked", exception.Code, exception.Message, null, 4, json);
+        }
+        catch (Exception exception) when (exception is SafePathException or FileNotFoundException or UnauthorizedAccessException)
+        {
+            return Write("repair plan", "blocked", "INTEGRITY_REPAIR_FAILED", exception.Message, null, 4, json);
         }
     }
 
@@ -382,6 +504,26 @@ internal sealed class CliInvocation
         }
     }
 
+    private async Task<int> InspectVaultIdentityAsync(bool json)
+    {
+        var vaultRoot = Option("vault-root");
+        if (string.IsNullOrWhiteSpace(vaultRoot))
+        {
+            return Write("vault identity", "needs-input", "VAULT_ROOT_REQUIRED", "Provide an explicit --vault-root; no live vault is selected by default.", null, 3, json);
+        }
+
+        try
+        {
+            var identity = await VaultInspector.InspectIdentityAsync(vaultRoot);
+            return Write("vault identity", "ok", "OK", "Read immutable vault identity and the current manifest digest without trusting protected content.", identity, 0, json);
+        }
+        catch (StorageFormatException exception) { return Write("vault identity", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (Exception exception) when (exception is SafePathException or FileNotFoundException or UnauthorizedAccessException)
+        {
+            return Write("vault identity", "blocked", "VAULT_IDENTITY_FAILED", exception.Message, null, 4, json);
+        }
+    }
+
     private async Task<int> BuildContextAsync(bool json)
     {
         var vaultRoot = Option("vault-root");
@@ -392,9 +534,19 @@ internal sealed class CliInvocation
 
         try
         {
-            var packet = await VaultInspector.BuildLegacyIndexPacketAsync(vaultRoot);
-            return Write("context", "ok", "OK", "Built the verified legacy index context packet.", new
+            var descriptor = TaskDescriptor.Create(
+                Option("project") ?? "global",
+                VaultInspector.ParseOperation(Option("operation") ?? "read"),
+                Csv("subjects"),
+                Csv("paths"),
+                VaultInspector.ParseAudience(Option("audience") ?? "private"),
+                BooleanOption("include-history", false),
+                IntegerOption("optional-budget-chars", 8000, minimum: 0));
+            var context = await VaultInspector.BuildTaskPacketAsync(vaultRoot, descriptor, NullableIntegerOption("max-total-chars", minimum: 0));
+            var packet = context.Packet;
+            return Write("context", "ok", "OK", "Built the verified deterministic task context packet.", new
             {
+                body = packet.Body,
                 body_sha256 = packet.BodySha256,
                 characters = packet.Characters,
                 utf8_bytes = packet.Utf8Bytes,
@@ -402,6 +554,14 @@ internal sealed class CliInvocation
                 segments = packet.Segments.Select(segment => new { segment.RouteId, segment.FileId, segment.RelativePath, segment.Mandatory, segment.CanonicalSha256 }),
                 diagnostics = packet.Diagnostics
             }, 0, json);
+        }
+        catch (ContextCatalogException exception)
+        {
+            return Write("context", "blocked", exception.Code, exception.Message, null, 4, json);
+        }
+        catch (Exception exception) when (exception is ArgumentException or FormatException or OverflowException)
+        {
+            return Write("context", "failed", "TASK_DESCRIPTOR_INVALID", exception.Message, null, 2, json);
         }
         catch (StorageFormatException exception)
         {
@@ -498,23 +658,73 @@ internal sealed class CliInvocation
         catch (AgentSessionException exception) { return Write("agent register", "blocked", exception.Code, exception.Message, null, 4, json); }
     }
 
-    private async Task<int> ReadAgentSessionAsync(bool json)
+    private async Task<int> BuildAgentContextAsync(bool json)
     {
-        var session = Option("session-id"); var path = Option("path");
-        if (string.IsNullOrWhiteSpace(session) || string.IsNullOrWhiteSpace(path))
+        var session = Option("session-id");
+        var operation = Option("operation");
+        if (string.IsNullOrWhiteSpace(session) || string.IsNullOrWhiteSpace(operation))
         {
-            return Write("agent read", "needs-input", "AGENT_READ_INPUT_REQUIRED", "Provide --session-id and a vault-relative --path. Register first; do not supply a vault path.", null, 3, json);
+            return Write("agent context", "needs-input", "AGENT_CONTEXT_INPUT_REQUIRED", "Provide --session-id and --operation read|edit|test|review|release|maintain-vault. Add comma-separated --subjects and repository-relative --paths when they apply.", null, 3, json);
         }
 
         try
         {
-            var result = await AgentSessions.ReadAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, path);
+            var result = await AgentSessions.BuildContextAsync(
+                AgentSessions.ResolveConfigRoot(Option("config-root")),
+                session,
+                VaultInspector.ParseOperation(operation),
+                Csv("subjects"),
+                Csv("paths"),
+                VaultInspector.ParseAudience(Option("audience") ?? "private"),
+                BooleanOption("include-history", false),
+                IntegerOption("optional-budget-chars", 8000, minimum: 0),
+                NullableIntegerOption("max-total-chars", minimum: 0));
+            return Write("agent context", "ok", "OK", "Loaded every applicable mandatory rule and the task-scoped optional context. Agent startup is complete for this session.", result, 0, json);
+        }
+        catch (AgentSessionException exception) { return Write("agent context", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (ContextCatalogException exception) { return Write("agent context", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent context", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (Exception exception) when (exception is ArgumentException or FormatException or OverflowException)
+        {
+            return Write("agent context", "failed", "TASK_DESCRIPTOR_INVALID", exception.Message, null, 2, json);
+        }
+        catch (Exception exception) when (exception is SafePathException or StorageFormatException or FileNotFoundException)
+        {
+            return Write("agent context", "blocked", "AGENT_CONTEXT_FAILED", exception.Message, null, 4, json);
+        }
+    }
+
+    private async Task<int> ReadAgentSessionAsync(bool json)
+    {
+        var session = Option("session-id"); var path = Option("path"); var paths = Option("paths");
+        if (!string.IsNullOrWhiteSpace(path) && !string.IsNullOrWhiteSpace(paths))
+        {
+            return Write("agent read", "failed", "AGENT_READ_INPUT_AMBIGUOUS", "Use --path for one file or --paths for a comma-separated set, not both.", null, 2, json);
+        }
+        if (string.IsNullOrWhiteSpace(session) || (string.IsNullOrWhiteSpace(path) && string.IsNullOrWhiteSpace(paths)))
+        {
+            return Write("agent read", "needs-input", "AGENT_READ_INPUT_REQUIRED", "Provide --session-id and either vault-relative --path or comma-separated --paths. Register first; do not supply a vault root.", null, 3, json);
+        }
+
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(paths))
+            {
+                var requested = paths.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                var batch = await AgentSessions.ReadManyAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, requested);
+                return batch.RequiresAdditionalRefresh
+                    ? Write("agent read", "blocked", "AGENT_BASIS_STALE", "The requested files were refreshed, but other previously read files changed. Refresh the reported relative paths before proceeding.", batch, 5, json)
+                    : Write("agent read", "ok", "OK", "Read the requested files in one verified snapshot and returned a fresh opaque basis hash.", batch, 0, json);
+            }
+
+            var result = await AgentSessions.ReadAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, path!);
             return result.RequiresAdditionalRefresh
                 ? Write("agent read", "blocked", "AGENT_BASIS_STALE", "The requested file was refreshed, but other previously read files changed. Refresh the reported relative paths before proceeding.", result, 5, json)
                 : Write("agent read", "ok", "OK", "Read content with a fresh opaque session basis hash.", result, 0, json);
         }
         catch (AgentSessionException exception) { return Write("agent read", "blocked", exception.Code, exception.Message, null, 4, json); }
-        catch (Exception exception) when (exception is VaultAuthoringException or SafePathException or StorageFormatException or FileNotFoundException) { return Write("agent read", "blocked", "AGENT_READ_FAILED", exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent read", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (Exception exception) when (exception is SafePathException or StorageFormatException or FileNotFoundException) { return Write("agent read", "blocked", "AGENT_READ_FAILED", exception.Message, null, 4, json); }
     }
 
     private async Task<int> WriteAgentSessionAsync(bool json)
@@ -540,7 +750,85 @@ internal sealed class CliInvocation
             return Write("agent write", "ok", "OK", "Committed the mediated write and invalidated affected readers. Read again to obtain a new basis hash before the next dependent operation.", result, 0, json);
         }
         catch (AgentSessionException exception) { return Write("agent write", "blocked", exception.Code, exception.Message, null, 4, json); }
-        catch (Exception exception) when (exception is VaultAuthoringException or SafePathException or StorageFormatException or WriteConflictException or FileNotFoundException) { return Write("agent write", "blocked", "AGENT_WRITE_FAILED", exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent write", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (Exception exception) when (exception is SafePathException or StorageFormatException or WriteConflictException or FileNotFoundException) { return Write("agent write", "blocked", "AGENT_WRITE_FAILED", exception.Message, null, 4, json); }
+    }
+
+    private async Task<int> ReadAgentRepositoryAsync(bool json)
+    {
+        var session = Option("session-id");
+        var path = Option("path");
+        if (string.IsNullOrWhiteSpace(session) || string.IsNullOrWhiteSpace(path))
+        {
+            return Write("agent repository read", "needs-input", "AGENT_REPOSITORY_READ_INPUT_REQUIRED", "Provide --session-id and a repository-relative .agents Markdown --path. The Git root is resolved from the registered workspace folder.", null, 3, json);
+        }
+
+        try
+        {
+            var result = await AgentSessions.ReadRepositoryAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, path);
+            return result.RequiresAdditionalRefresh
+                ? Write("agent repository read", "blocked", "AGENT_BASIS_STALE", "The requested repository file was refreshed, but other previously read data changed.", result, 5, json)
+                : Write("agent repository read", "ok", "OK", "Read current-branch .agents data through the no-follow Git ingest gate and refreshed the opaque basis hash.", result, 0, json);
+        }
+        catch (AgentSessionException exception) { return Write("agent repository read", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent repository read", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (SafePathException exception) { return WriteRepositoryPathFailure("agent repository read", exception, json); }
+        catch (Exception exception) when (exception is StorageFormatException or FileNotFoundException)
+        {
+            return Write("agent repository read", "blocked", "AGENT_REPOSITORY_READ_FAILED", exception.Message, null, 4, json);
+        }
+    }
+
+    private async Task<int> WriteAgentRepositoryAsync(bool json)
+    {
+        var session = Option("session-id");
+        var path = Option("path");
+        var content = Option("content");
+        var contentFile = Option("content-file");
+        if (content is not null && contentFile is not null)
+        {
+            return Write("agent repository write", "failed", "CONTENT_INPUT_AMBIGUOUS", "Use exactly one of --content or --content-file.", null, 2, json);
+        }
+        if (contentFile is not null) { content = await File.ReadAllTextAsync(contentFile); }
+        if (string.IsNullOrWhiteSpace(session) || string.IsNullOrWhiteSpace(path) || content is null)
+        {
+            return Write("agent repository write", "needs-input", "AGENT_REPOSITORY_WRITE_INPUT_REQUIRED", "Provide --session-id, .agents Markdown --path, and --content or --content-file. Existing files require the hash returned by agent repository read.", null, 3, json);
+        }
+
+        try
+        {
+            var result = await AgentSessions.WriteRepositoryAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, path, content, Option("expected-raw-sha256"));
+            return Write("agent repository write", "ok", "OK", "Committed the current-branch .agents change through the no-follow gate and invalidated affected readers.", result, 0, json);
+        }
+        catch (AgentSessionException exception) { return Write("agent repository write", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent repository write", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (SafePathException exception) { return WriteRepositoryPathFailure("agent repository write", exception, json); }
+        catch (Exception exception) when (exception is StorageFormatException or WriteConflictException or FileNotFoundException)
+        {
+            return Write("agent repository write", "blocked", "AGENT_REPOSITORY_WRITE_FAILED", exception.Message, null, 4, json);
+        }
+    }
+
+    private async Task<int> InitializeAgentRepositoryAsync(bool json)
+    {
+        var session = Option("session-id"); var project = Option("project"); var title = Option("title");
+        if (string.IsNullOrWhiteSpace(session) || string.IsNullOrWhiteSpace(project) || string.IsNullOrWhiteSpace(title))
+        {
+            return Write("agent repository initialize", "needs-input", "AGENT_REPOSITORY_INITIALIZE_INPUT_REQUIRED", "Provide --session-id, --project, and --title after creating or inspecting the private project.", null, 3, json);
+        }
+
+        try
+        {
+            var result = await AgentSessions.InitializeRepositoryAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, project, title);
+            return Write("agent repository initialize", "ok", "OK", "Created a Git-backed .agents candidate scaffold with matching project identity and a branch-local integrity manifest. Normal Git review and publication are still required.", result, 0, json);
+        }
+        catch (AgentSessionException exception) { return Write("agent repository initialize", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent repository initialize", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (SafePathException exception) { return WriteRepositoryPathFailure("agent repository initialize", exception, json); }
+        catch (Exception exception) when (exception is StorageFormatException or WriteConflictException or FileNotFoundException)
+        {
+            return Write("agent repository initialize", "blocked", "AGENT_REPOSITORY_INITIALIZE_FAILED", exception.Message, null, 4, json);
+        }
     }
 
     private async Task<int> ShowAgentUsageAsync(bool json)
@@ -577,7 +865,31 @@ internal sealed class CliInvocation
 
         try { var result = await AgentSessions.CreateProjectAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, slug, title, Option("purpose"), Option("end-goal")); return Write("agent project create", "ok", "OK", "Created the mediated project structure and invalidated affected readers.", result, 0, json); }
         catch (AgentSessionException exception) { return Write("agent project create", "blocked", exception.Code, exception.Message, null, 4, json); }
-        catch (Exception exception) when (exception is VaultAuthoringException or StorageFormatException or WriteConflictException) { return Write("agent project create", "blocked", "AGENT_PROJECT_CREATE_FAILED", exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent project create", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (Exception exception) when (exception is StorageFormatException or WriteConflictException) { return Write("agent project create", "blocked", "AGENT_PROJECT_CREATE_FAILED", exception.Message, null, 4, json); }
+    }
+
+    private async Task<int> InspectAgentProjectAsync(bool json)
+    {
+        var session = Option("session-id"); var project = Option("project");
+        if (string.IsNullOrWhiteSpace(session) || string.IsNullOrWhiteSpace(project))
+        {
+            return Write("agent project inspect", "needs-input", "AGENT_PROJECT_INPUT_REQUIRED", "Provide --session-id and --project. The private project pointer remains internal.", null, 3, json);
+        }
+
+        try
+        {
+            var result = await AgentSessions.InspectProjectAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, project);
+            return result.RequiresAdditionalRefresh
+                ? Write("agent project inspect", "blocked", "AGENT_BASIS_STALE", "Project identity was refreshed, but other previously read data changed.", result, 5, json)
+                : Write("agent project inspect", "ok", "OK", "Verified the private project identity and storage state without disclosing its location.", result, 0, json);
+        }
+        catch (AgentSessionException exception) { return Write("agent project inspect", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent project inspect", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (Exception exception) when (exception is SafePathException or StorageFormatException or FileNotFoundException)
+        {
+            return Write("agent project inspect", "blocked", "AGENT_PROJECT_INSPECTION_FAILED", exception.Message, null, 4, json);
+        }
     }
 
     private async Task<int> InspectAgentDailyAsync(bool json)
@@ -595,7 +907,8 @@ internal sealed class CliInvocation
 
         try { var result = await AgentSessions.InspectDailyAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, project, date); return result.RequiresAdditionalRefresh ? Write("agent daily inspect", "blocked", "AGENT_BASIS_STALE", "The active daily note was refreshed, but other data must be refreshed before proceeding.", result, 5, json) : Write("agent daily inspect", "ok", "OK", "Returned the current daily note with a fresh opaque basis hash.", result, 0, json); }
         catch (AgentSessionException exception) { return Write("agent daily inspect", "blocked", exception.Code, exception.Message, null, 4, json); }
-        catch (Exception exception) when (exception is VaultAuthoringException or StorageFormatException or FileNotFoundException) { return Write("agent daily inspect", "blocked", "AGENT_DAILY_INSPECTION_FAILED", exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent daily inspect", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (Exception exception) when (exception is StorageFormatException or FileNotFoundException) { return Write("agent daily inspect", "blocked", "AGENT_DAILY_INSPECTION_FAILED", exception.Message, null, 4, json); }
     }
 
     private async Task<int> RolloverAgentDailyAsync(bool json)
@@ -608,7 +921,8 @@ internal sealed class CliInvocation
 
         try { var result = await AgentSessions.RolloverDailyAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, project, date, expected, string.Equals(Option("promotions-complete"), "true", StringComparison.OrdinalIgnoreCase)); return Write("agent daily rollover", "ok", "OK", "Archived the explicitly reviewed daily note and created the next note.", result, 0, json); }
         catch (AgentSessionException exception) { return Write("agent daily rollover", "blocked", exception.Code, exception.Message, null, 4, json); }
-        catch (Exception exception) when (exception is VaultAuthoringException or StorageFormatException or WriteConflictException) { return Write("agent daily rollover", "blocked", "AGENT_DAILY_ROLLOVER_FAILED", exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent daily rollover", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (Exception exception) when (exception is StorageFormatException or WriteConflictException) { return Write("agent daily rollover", "blocked", "AGENT_DAILY_ROLLOVER_FAILED", exception.Message, null, 4, json); }
     }
 
     private async Task<int> InspectAgentLinksAsync(bool json)
@@ -621,7 +935,8 @@ internal sealed class CliInvocation
 
         try { var result = await AgentSessions.InspectLinksAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, path); return result.RequiresAdditionalRefresh ? Write("agent links", "blocked", "AGENT_BASIS_STALE", "The requested link metadata was refreshed, but other data must be refreshed before proceeding.", result, 5, json) : Write("agent links", "ok", "OK", "Returned inbound-link metadata with a fresh opaque basis hash.", result, 0, json); }
         catch (AgentSessionException exception) { return Write("agent links", "blocked", exception.Code, exception.Message, null, 4, json); }
-        catch (Exception exception) when (exception is VaultAuthoringException or StorageFormatException or FileNotFoundException) { return Write("agent links", "blocked", "AGENT_LINKS_FAILED", exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent links", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (Exception exception) when (exception is StorageFormatException or FileNotFoundException) { return Write("agent links", "blocked", "AGENT_LINKS_FAILED", exception.Message, null, 4, json); }
     }
 
     private async Task<int> DeleteAgentContentAsync(bool json)
@@ -634,7 +949,8 @@ internal sealed class CliInvocation
 
         try { var result = await AgentSessions.DeleteAsync(AgentSessions.ResolveConfigRoot(Option("config-root")), session, path, expected); return Write("agent delete", "ok", "OK", "Deleted mediated content and invalidated affected readers.", result, 0, json); }
         catch (AgentSessionException exception) { return Write("agent delete", "blocked", exception.Code, exception.Message, null, 4, json); }
-        catch (Exception exception) when (exception is VaultAuthoringException or StorageFormatException or WriteConflictException or FileNotFoundException) { return Write("agent delete", "blocked", "AGENT_DELETE_FAILED", exception.Message, null, 4, json); }
+        catch (VaultAuthoringException exception) { return Write("agent delete", "blocked", exception.Code, exception.Message, null, 4, json); }
+        catch (Exception exception) when (exception is StorageFormatException or WriteConflictException or FileNotFoundException) { return Write("agent delete", "blocked", "AGENT_DELETE_FAILED", exception.Message, null, 4, json); }
     }
 
     private async Task<int> WriteAgentOutputAsync(bool json)
@@ -691,7 +1007,11 @@ internal sealed class CliInvocation
 
         try
         {
-            var written = await LifecycleApplier.ApplyAsync(plan, [], DateTimeOffset.UtcNow);
+            var acceptedDecisions = (Option("accept-decision") ?? string.Empty)
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(decisionId => new LifecycleDecision(decisionId, plan.PlanSha256, plan.PlanSha256, "accepted"))
+                .ToArray();
+            var written = await LifecycleApplier.ApplyAsync(plan, acceptedDecisions, DateTimeOffset.UtcNow);
             return Write("plan apply", "ok", "OK", $"Applied {written.Count} operations.", new { written }, 0, json);
         }
         catch (LifecycleException exception)
@@ -702,18 +1022,25 @@ internal sealed class CliInvocation
 
     private static async Task<LifecyclePlan> ReadPlanAsync(string path)
     {
-        var text = await File.ReadAllTextAsync(path);
-        return JsonSerializer.Deserialize<LifecyclePlan>(text, JsonOptions)
+        var bytes = await File.ReadAllBytesAsync(path);
+        using var strict = StrictJson.Parse(bytes);
+        return JsonSerializer.Deserialize<LifecyclePlan>(strict.RootElement.GetRawText(), JsonOptions)
             ?? throw new InvalidDataException("Plan JSON could not be parsed.");
     }
 
     private int WriteHelp(bool json)
     {
         var text = "Rule Vault CLI\n\n" +
-            "Agent workflow: agent register/read/write/status (usage/list aliases)/clear, agent capabilities. Agent commands resolve the selected vault internally and never disclose its location.\n\n" +
-            "Administrative workflow: capabilities, version, status, doctor, vault inspect/read/write/links/delete, project create, daily inspect/rollover, context, agents discover/write, agents bootstrap discover/apply, install plan, update plan, plan show, plan apply.\n" +
+            "Agent workflow: agent capabilities, agent register, required agent context startup, agent read/write, agent repository read/write, agent project create, agent daily inspect/rollover, agent links/delete, and agent status/clear. Agent commands resolve the selected vault internally and never disclose its location.\n\n" +
+            "Administrative workflow: capabilities, version, status, doctor, vault inspect/read/write/links/delete, project create, daily inspect/rollover, context, agents discover/write, agents bootstrap discover/apply, install plan, update plan, repair plan, plan show, plan apply.\n" +
             "Use --format text, json, or table. Use --output-file <path> to export the selected representation. Agent reads return a new opaque basis hash; stale sessions must refresh before writing.";
         return Write("help", "ok", "OK", text, null, 0, json);
+    }
+
+    private int WriteRepositoryPathFailure(string command, SafePathException exception, bool json)
+    {
+        var summary = $"The repository ingest gate rejected this path ({exception.Code}): {exception.Message}";
+        return Write(command, "blocked", "RV-SEC-001", summary, null, 4, json);
     }
 
     private int Write(string command, string status, string code, string summary, object? data, int exitCode, bool json)
@@ -864,11 +1191,47 @@ internal sealed class CliInvocation
 
     private string? Option(string key) => _options.TryGetValue(key, out var value) ? value : null;
 
-    private static bool IsKnownCommand(string command) => command is
-        "setup" or "vault list" or "vault select" or "migrate plan" or "repair plan" or
-        "recover list" or "recover resume" or "rollback plan" or "check" or
-        "memory plan" or "changes plan" or "agents list" or "agents discover" or "agents plan" or
-        "agents probe" or "run" or "package verify" or "self-update plan" or "uninstall plan" or "cleanup plan" or "context explain";
+    private string[] Csv(string key) => (Option(key) ?? string.Empty)
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Distinct(StringComparer.Ordinal)
+        .ToArray();
+
+    private bool BooleanOption(string key, bool defaultValue)
+    {
+        var value = Option(key);
+        if (string.IsNullOrWhiteSpace(value)) { return defaultValue; }
+        return value switch
+        {
+            "true" => true,
+            "false" => false,
+            _ => throw new FormatException($"--{key} must be true or false.")
+        };
+    }
+
+    private int IntegerOption(string key, int defaultValue, int minimum)
+    {
+        var value = Option(key);
+        if (string.IsNullOrWhiteSpace(value)) { return defaultValue; }
+        if (!int.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var result) || result < minimum)
+        {
+            throw new FormatException($"--{key} must be an integer greater than or equal to {minimum}.");
+        }
+        return result;
+    }
+
+    private int? NullableIntegerOption(string key, int minimum)
+    {
+        var value = Option(key);
+        return string.IsNullOrWhiteSpace(value) ? null : IntegerOption(key, minimum, minimum);
+    }
+
+    private static object UnavailableCommand(string command)
+    {
+        var operation = UnavailableOperations.Single(item => item.Command == command);
+        return new { command = operation.Command, reason = operation.Reason, supported_alternative = operation.Alternative };
+    }
+
+    private static bool IsKnownCommand(string command) => UnavailableOperations.Any(item => item.Command == command);
 
     private async Task<int> ReadVaultAsync(bool json)
     {
@@ -958,17 +1321,17 @@ internal sealed class CliInvocation
             return Write("daily inspect", "failed", "DATE_INVALID", "Use an ISO local date (YYYY-MM-DD).", null, 2, json);
         }
 
-        try { var result = await VaultAuthoring.InspectDailyAsync(root, project, date); return Write("daily inspect", "ok", "OK", result.RolloverRequired ? "Daily rollover is required; previous note is returned for explicit review and promotion." : "Current daily note is ready.", result, 0, json); }
+        try { var result = await VaultAuthoring.InspectDailyAsync(root, project, date, Option("config-root")); return Write("daily inspect", "ok", "OK", result.RolloverRequired ? "Daily rollover is required; previous note is returned for explicit review and promotion." : "Current daily note is ready.", result, 0, json); }
         catch (VaultAuthoringException exception) { return Write("daily inspect", "blocked", exception.Code, exception.Message, null, 4, json); }
         catch (Exception exception) when (exception is SafePathException or StorageFormatException or FileNotFoundException) { return Write("daily inspect", "blocked", "DAILY_INSPECTION_FAILED", exception.Message, null, 4, json); }
     }
 
     private async Task<int> RolloverDailyAsync(bool json)
     {
-        var root = Option("vault-root"); var project = Option("project"); var expected = Option("expected-raw-sha256");
-        if (string.IsNullOrWhiteSpace(root) || string.IsNullOrWhiteSpace(project) || string.IsNullOrWhiteSpace(expected))
+        var root = Option("vault-root"); var config = Option("config-root"); var project = Option("project"); var expected = Option("expected-raw-sha256");
+        if (string.IsNullOrWhiteSpace(root) || string.IsNullOrWhiteSpace(config) || string.IsNullOrWhiteSpace(project) || string.IsNullOrWhiteSpace(expected))
         {
-            return Write("daily rollover", "needs-input", "DAILY_ROLLOVER_INPUT_REQUIRED", "Inspect the active note first, then provide --vault-root, --project, --expected-raw-sha256, --date, and --promotions-complete true.", null, 3, json);
+            return Write("daily rollover", "needs-input", "DAILY_ROLLOVER_INPUT_REQUIRED", "Inspect the active note first, then provide --vault-root, --config-root, --project, --expected-raw-sha256, --date, and --promotions-complete true.", null, 3, json);
         }
 
         if (!DateOnly.TryParse(Option("date") ?? string.Empty, out var date))
@@ -976,7 +1339,7 @@ internal sealed class CliInvocation
             return Write("daily rollover", "failed", "DATE_INVALID", "Use an ISO local date (YYYY-MM-DD).", null, 2, json);
         }
 
-        try { var result = await VaultAuthoring.RolloverDailyAsync(root, project, date, expected, string.Equals(Option("promotions-complete"), "true", StringComparison.OrdinalIgnoreCase)); return Write("daily rollover", "ok", "OK", result.Count == 0 ? "No rollover was required." : "Archived the reviewed daily note and created the new active daily note.", new { changed_paths = result }, 0, json); }
+        try { var result = await VaultAuthoring.RolloverDailyAsync(root, config, project, date, expected, string.Equals(Option("promotions-complete"), "true", StringComparison.OrdinalIgnoreCase)); return Write("daily rollover", "ok", "OK", result.Count == 0 ? "No rollover was required." : "Archived the reviewed daily note and created the new active daily note.", new { changed_paths = result }, 0, json); }
         catch (VaultAuthoringException exception) { return Write("daily rollover", "blocked", exception.Code, exception.Message, null, 4, json); }
         catch (Exception exception) when (exception is SafePathException or StorageFormatException or WriteConflictException or FileNotFoundException) { return Write("daily rollover", "blocked", "DAILY_ROLLOVER_FAILED", exception.Message, null, 4, json); }
     }
@@ -991,7 +1354,8 @@ internal sealed class CliInvocation
 
         try { var result = await RepositoryAgentsAuthoring.ReadAsync(root, path); return Write("repository agents read", "ok", "OK", "Read a Git-gated .agents file with its raw SHA-256.", result, 0, json); }
         catch (VaultAuthoringException exception) { return Write("repository agents read", "blocked", exception.Code, exception.Message, null, 4, json); }
-        catch (Exception exception) when (exception is SafePathException or FileNotFoundException or StorageFormatException) { return Write("repository agents read", "blocked", "REPOSITORY_AGENTS_READ_FAILED", exception.Message, null, 4, json); }
+        catch (SafePathException exception) { return WriteRepositoryPathFailure("repository agents read", exception, json); }
+        catch (Exception exception) when (exception is FileNotFoundException or StorageFormatException) { return Write("repository agents read", "blocked", "REPOSITORY_AGENTS_READ_FAILED", exception.Message, null, 4, json); }
     }
 
     private async Task<int> WriteRepositoryAgentsAsync(bool json)
@@ -1014,7 +1378,8 @@ internal sealed class CliInvocation
 
         try { var result = await RepositoryAgentsAuthoring.WriteAsync(new RepositoryAgentsWriteRequest(root, path, content, Option("expected-raw-sha256"))); return Write("repository agents write", "ok", "OK", "Wrote ordinary Git-gated .agents Markdown through the dedicated adapter.", result, 0, json); }
         catch (VaultAuthoringException exception) { return Write("repository agents write", "blocked", exception.Code, exception.Message, null, 4, json); }
-        catch (Exception exception) when (exception is SafePathException or FileNotFoundException or WriteConflictException) { return Write("repository agents write", "blocked", "REPOSITORY_AGENTS_WRITE_FAILED", exception.Message, null, 4, json); }
+        catch (SafePathException exception) { return WriteRepositoryPathFailure("repository agents write", exception, json); }
+        catch (Exception exception) when (exception is FileNotFoundException or WriteConflictException) { return Write("repository agents write", "blocked", "REPOSITORY_AGENTS_WRITE_FAILED", exception.Message, null, 4, json); }
     }
 
     private static object CapabilityContract() => new
@@ -1025,8 +1390,9 @@ internal sealed class CliInvocation
         operations = new object[]
         {
             new { name = "agent register", purpose = "Register an opaque agent session with its friendly name, thread/session identity, folder context, and project.", safety = "selected vault resolves internally; stale sessions expire after three days" },
-            new { name = "agent read", purpose = "Read managed vault content and receive a new opaque freshness basis hash.", safety = "blocks dependent work when previously read content changed; never returns the vault location" },
+            new { name = "agent read", purpose = "Read one managed file with --path or one verified set with --paths and receive a new opaque freshness basis hash.", safety = "verifies requested protected files; blocks dependent work when previously read content changed; never returns the vault location" },
             new { name = "agent write", purpose = "Commit a mediated managed Markdown write for a registered, current session.", safety = "raw-hash precondition; stale-basis block; affected reader sessions are invalidated" },
+            new { name = "agent repository read/write/initialize", purpose = "Use the registered workspace folder to initialize or access current-branch .agents Markdown/metadata without disclosing the private vault.", safety = "Git object and no-follow path gate on every access; strict parse plus applicable schema validation before verified authority; protected shared files are paired with their branch manifest" },
             new { name = "agent usage", purpose = "Show compact token totals or per-file read/write token and access details.", safety = "cl100k_base model-agnostic estimate; no vault-root disclosure" },
             new { name = "agent status", purpose = "Alias for agent usage; show sessions with current or stale content bases.", safety = "does not disclose the private vault filesystem location" },
             new { name = "agent clear", purpose = "Remove one registered session or all session records.", safety = "explicit session id or --all true" },
@@ -1038,10 +1404,11 @@ internal sealed class CliInvocation
             new { name = "project create", purpose = "Create a project router, rules/context indexes, current state, and daily stream.", safety = "explicit project identity; root index integrity transaction" },
             new { name = "daily inspect", purpose = "Return the full active note and tell the agent whether rollover is required.", safety = "no mutation" },
             new { name = "daily rollover", purpose = "Archive a reviewed daily note after explicit promotions and create the next daily note.", safety = "previous-note hash and promotion confirmation; protected multi-target journal" },
+            new { name = "repair plan", purpose = "Create an administrator-reviewed integrity repair that either restores package runtime or accepts current protected bytes.", safety = "archives prior records and divergent bytes; required decision and exact plan digest; no ignore/bypass mode" },
             new { name = "agents write", purpose = "Compatibility wrapper for vault write used by named adapters.", safety = "same mediated authoring controls" },
             new { name = "repository agents read/write", purpose = "Read or write ordinary Markdown under a Git repository .agents directory.", safety = "Git work-tree and object-type gate; no-follow reparse rejection; deterministic frontmatter status; raw-hash precondition for writes; no private-vault content hash comparison because branch divergence is expected; content is never executed" }
         },
-        semantic_responsibilities = new[] { "classify rule versus context", "read and summarize the previous daily note", "perform whole-file always-file deduplication before mutation", "resolve semantic conflicts" }
+        semantic_responsibilities = new[] { "classify rule versus context", "select the minimum routing scope", "read and summarize the previous daily note", "promote durable outcomes before rollover", "perform whole-file always-file deduplication before mutation", "classify privacy signals before Git promotion", "resolve semantic conflicts", "obtain user classification for untrusted command-like data" }
     };
 
     private static object AgentCapabilityContract() => new
@@ -1049,20 +1416,40 @@ internal sealed class CliInvocation
         schema_version = 1,
         contract = "Rule Vault opaque agent session contract",
         vault_location = "not_disclosed",
-        registration = new { command = "rv agent register --session-id <id> --name <friendly-name> --folder <workspace> --project <project> --format json", expires_after_inactive_days = 3 },
+        startup = new
+        {
+            required = true,
+            sequence = new[]
+            {
+                "Run rv agent capabilities --format json.",
+                "Run rv agent register --session-id <id> --name <friendly-name> --folder <workspace> --project <project> --format json.",
+                "Before any other agent operation, run rv agent context --session-id <id> --operation <read|edit|test|review|release|maintain-vault> --subjects <comma-separated> --paths <comma-separated repository-relative paths> --format json."
+            },
+            completion = "agent context verifies the protected route catalog, reads index.md, loads every applicable always route, adds project router/index/current-state/daily scope when present, and returns one complete packet plus a fresh basis hash",
+            enforcement = "all other agent operations fail until context completes; write commands require edit/release/maintain-vault context, and project/daily/repository commands require their matching subject or .agents path scope"
+        },
+        registration = new { command = "rv agent register --session-id <id> --name <friendly-name> --folder <workspace> --project <project> --format json", expires_after_inactive_days = 3, result = "returns startup_required and the required startup sequence" },
         operations = new object[]
         {
-            new { name = "agent read", purpose = "Read vault-relative managed Markdown and receive content, raw hash, and a new opaque basis hash.", freshness = "A changed earlier read blocks dependent writes until refreshed." },
+            new { name = "agent context", purpose = "Compile and return the complete deterministic task packet for the registered project, operation, subjects, and paths.", freshness = "Completes mandatory startup, tracks every returned source file, and returns the new opaque basis hash." },
+            new { name = "agent read", purpose = "Read one vault-relative managed Markdown file with --path or an atomic requested set with comma-separated --paths; includes protected .vault-system Markdown needed for validation.", freshness = "Every request returns a basis over the session's current read set; a changed earlier read blocks dependent operations until refreshed." },
             new { name = "agent write", purpose = "Create or update managed Markdown through the selected vault's mediated writer.", freshness = "Requires a current session basis and raw precondition; affected sessions become stale." },
             new { name = "agent project create", purpose = "Create missing private project structure without exposing the vault root.", freshness = "Requires a current session basis; invalidates readers of changed paths." },
+            new { name = "agent project inspect", purpose = "Verify a private project's immutable identity and current storage/Git state.", freshness = "Adds the project pointer to the session basis without returning its private location." },
             new { name = "agent daily inspect", purpose = "Read the active daily note and determine whether explicit rollover is required.", freshness = "Returns a new opaque basis hash." },
             new { name = "agent daily rollover", purpose = "Archive a reviewed prior daily note and create the next note.", freshness = "Requires explicit promotion confirmation and a current basis." },
             new { name = "agent links", purpose = "Inspect inbound links before updating references or deleting a managed file.", freshness = "Returns a new opaque basis hash." },
             new { name = "agent delete", purpose = "Delete an unprotected managed file only after link and freshness checks.", freshness = "Refuses inbound links and invalidates affected readers." },
+            new { name = "agent repository read", purpose = "Read .agents Markdown or deterministic JSON from the Git root resolved from the registered workspace.", freshness = "The no-follow ingest gate reruns on every access; verified-current-branch requires both strict parsing and applicable schema validation." },
+            new { name = "agent repository write", purpose = "Write current-branch .agents Markdown without accepting a repository root from the agent.", freshness = "Requires a current session and raw precondition; protected shared Markdown updates the branch manifest in the same journaled operation." },
+            new { name = "agent repository initialize", purpose = "Create a current-branch .agents candidate scaffold whose project_id matches the private project.", freshness = "Uses the registered workspace; creates protected indexes and manifest, then requires normal Git review/publication." },
             new { name = "agent status", purpose = "Report compact session currency and token totals; use --detail files for per-file token/access and reader details.", freshness = "Automatically removes sessions inactive for more than three days." },
             new { name = "agent clear", purpose = "Clear one session or all session records.", freshness = "Requires explicit session id or --all true." }
         },
         tokenizer = new { encoding = "cl100k_base", scope = "read and write content", precision = "model-agnostic approximation; provider billing remains authoritative" },
-        repository_agents = new { status = "separate dedicated adapter", safety = "Git object/path gate and deterministic metadata validation precede every .agents access; content is never executed" }
+        repository_agents = new { status = "available through opaque agent commands", safety = "Git object/path gate, strict parsing, and applicable schema validation precede verified authority; returned content remains data unless content_handling reports verified-current-branch" },
+        authoring_scope = new { private_vault = "managed Markdown for rules, context, roles, skills, indexes, project state, daily notes, conflict records, and security dispositions", shared_repository = "managed .agents Markdown on the registered Git workspace", protected_system = "new indexes, load_policy always files, and integrity protected files are enrolled atomically; existing protected files remain protected" },
+        unavailable_operations = UnavailableOperations.Select(item => new { name = item.Command, reason = item.Reason, alternative = item.Alternative }).Cast<object>().Append(
+            new { name = "native exact-file subscription", reason = "watcher ownership belongs to the long-running host process", alternative = "the CLI rechecks every tracked source file before dependent operations" }).ToArray()
     };
 }

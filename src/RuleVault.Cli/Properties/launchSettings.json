@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "RuleVault.Cli": {
+      "commandName": "Project",
+      "commandLineArgs": "agent capabilities --format json"
+    }
+  }
+}

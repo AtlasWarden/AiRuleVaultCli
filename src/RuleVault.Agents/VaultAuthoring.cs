@@ -17,9 +17,11 @@ public sealed record VaultWriteRequest(string VaultRoot, string? ConfigRoot, str
 public sealed record VaultReadResult(string RelativePath, string Content, string RawSha256, bool IsIntegrityProtected);
 public sealed record VaultWriteResult(string RelativePath, string RawSha256, bool Created, bool IntegrityUpdated, IReadOnlyList<string> LinkTargetsChanged);
 public sealed record InboundLinkInfo(string RelativePath, string FileId, bool HasInboundLinks, IReadOnlyList<string> InboundSources);
+public sealed record VaultLinkInspection(VaultReadResult File, InboundLinkInfo Links);
 public sealed record DailyInspection(string Project, string ActiveRelativePath, string ActiveRawSha256, string ActiveContent, DateOnly ActiveDate, bool RolloverRequired);
 public sealed record ProjectCreateRequest(string VaultRoot, string ConfigRoot, string Slug, string Title, string? Purpose, string? EndGoal);
-public sealed record ProjectCreateResult(string Project, IReadOnlyList<string> CreatedPaths, string RootIndexRawSha256);
+public sealed record ProjectCreateResult(string Project, string ProjectId, IReadOnlyList<string> CreatedPaths, IReadOnlyList<string> ChangedPaths, string RootIndexRawSha256);
+public sealed record ProjectInspection(string Project, string ProjectId, string StorageMode, string GitState, string RawSha256);
 
 public sealed class VaultAuthoringException : Exception
 {
@@ -36,23 +38,49 @@ public static class VaultAuthoring
 
     public static async Task<VaultReadResult> ReadAsync(string vaultRoot, string relativePath, CancellationToken cancellationToken = default)
     {
+        return (await ReadManyAsync(vaultRoot, [relativePath], cancellationToken)).Single();
+    }
+
+    public static async Task<IReadOnlyList<VaultReadResult>> ReadManyAsync(string vaultRoot, IReadOnlyList<string> relativePaths, CancellationToken cancellationToken = default)
+    {
+        if (relativePaths.Count == 0)
+        {
+            throw new VaultAuthoringException("VAULT_READ_PATH_REQUIRED", "At least one managed Markdown path is required.");
+        }
+
         await VerifyVaultAsync(vaultRoot, cancellationToken);
-        EnsureAuthorablePath(relativePath);
-        var bytes = await TrustedFileSystem.ReadAllBytesAsync(vaultRoot, relativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
-        return new VaultReadResult(relativePath, CanonicalHash.DecodeUtf8(bytes), CanonicalHash.Raw(bytes), await IsProtectedAsync(vaultRoot, relativePath, cancellationToken));
+        var protectedHashes = await ReadProtectedHashesAsync(vaultRoot, cancellationToken);
+        var results = new List<VaultReadResult>(relativePaths.Count);
+        foreach (var relativePath in relativePaths.Distinct(StringComparer.Ordinal))
+        {
+            EnsureReadablePath(relativePath);
+            var bytes = await TrustedFileSystem.ReadAllBytesAsync(vaultRoot, relativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+            var content = CanonicalHash.DecodeUtf8(bytes);
+            var isProtected = protectedHashes.TryGetValue(relativePath, out var expectedHash);
+            if (isProtected && !string.Equals(CanonicalHash.Text(content), expectedHash, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new VaultAuthoringException("INTEGRITY_HASH_MISMATCH", $"Protected content does not match the manifest: '{relativePath}'.");
+            }
+            results.Add(new VaultReadResult(relativePath, content, CanonicalHash.Raw(bytes), isProtected));
+        }
+
+        return results;
     }
 
     public static async Task<VaultWriteResult> WriteAsync(VaultWriteRequest request, CancellationToken cancellationToken = default)
     {
         await VerifyVaultAsync(request.VaultRoot, cancellationToken);
         EnsureAuthorablePath(request.RelativePath);
-        ValidateMarkdown(request.RelativePath, request.Content);
+        var metadata = ManagedDocumentMetadataValidator.Parse(request.RelativePath, request.Content, requireCompleteSchema: false);
 
         var target = SafePath.ValidateRelative(request.VaultRoot, request.RelativePath, SafePathProfile.PrivateConfig);
         TrustedFileSystem.EnsureSupported(target);
         var exists = File.Exists(target.FullPath!);
-        var previous = exists ? await TrustedFileSystem.ReadTextAsync(request.VaultRoot, request.RelativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken) : null;
-        var previousRaw = exists ? CanonicalHash.Raw(await TrustedFileSystem.ReadAllBytesAsync(request.VaultRoot, request.RelativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken)) : "MISSING";
+        var previousBytes = exists
+            ? await TrustedFileSystem.ReadAllBytesAsync(request.VaultRoot, request.RelativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken)
+            : null;
+        var previous = previousBytes is null ? null : CanonicalHash.DecodeUtf8(previousBytes);
+        var previousRaw = previousBytes is null ? "MISSING" : CanonicalHash.Raw(previousBytes);
         if (!string.Equals(previousRaw, request.ExpectedRawSha256, StringComparison.OrdinalIgnoreCase) && (exists || request.ExpectedRawSha256 is not null))
         {
             throw new VaultAuthoringException("WRITE_PRECONDITION_FAILED", $"Read '{request.RelativePath}' again and supply its current raw SHA-256 before writing.");
@@ -61,7 +89,7 @@ public static class VaultAuthoring
         var oldLinks = previous is null ? new HashSet<string>(StringComparer.Ordinal) : ResolveManagedLinks(request.VaultRoot, request.RelativePath, previous);
         var newLinks = ResolveManagedLinks(request.VaultRoot, request.RelativePath, request.Content);
         var changedLinks = oldLinks.Where(link => !newLinks.Contains(link)).Concat(newLinks.Where(link => !oldLinks.Contains(link))).OrderBy(value => value, StringComparer.Ordinal).ToArray();
-        var protectedFile = await IsProtectedAsync(request.VaultRoot, request.RelativePath, cancellationToken);
+        var protectedFile = await IsProtectedAsync(request.VaultRoot, request.RelativePath, cancellationToken) || metadata.RequiresIntegrityProtection;
         if (protectedFile && string.IsNullOrWhiteSpace(request.ConfigRoot))
         {
             throw new VaultAuthoringException("PROTECTED_WRITE_CONFIG_REQUIRED", "Writing integrity-protected content requires --config-root so the manifest and registry anchor can be updated together.");
@@ -70,7 +98,9 @@ public static class VaultAuthoring
         var writes = new List<Mutation> { new(request.VaultRoot, request.RelativePath, request.Content, previousRaw) };
         foreach (var linkTarget in changedLinks)
         {
-            var inbound = await ReadInboundAsync(request.VaultRoot, linkTarget, cancellationToken);
+            var targetBytes = await TrustedFileSystem.ReadAllBytesAsync(request.VaultRoot, linkTarget, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+            var targetContent = CanonicalHash.DecodeUtf8(targetBytes);
+            var inbound = await ReadInboundAsync(request.VaultRoot, linkTarget, targetContent, cancellationToken);
             if (newLinks.Contains(linkTarget))
             {
                 inbound.Add(request.RelativePath);
@@ -80,8 +110,7 @@ public static class VaultAuthoring
                 inbound.Remove(request.RelativePath);
             }
 
-            var targetContent = await TrustedFileSystem.ReadTextAsync(request.VaultRoot, linkTarget, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
-            var targetRaw = CanonicalHash.Raw(await TrustedFileSystem.ReadAllBytesAsync(request.VaultRoot, linkTarget, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken));
+            var targetRaw = CanonicalHash.Raw(targetBytes);
             var updatedTarget = SetInboundFlag(targetContent, inbound.Count > 0);
             writes.Add(new Mutation(request.VaultRoot, linkTarget, updatedTarget, targetRaw));
             var id = GetFileId(targetContent, linkTarget);
@@ -97,29 +126,37 @@ public static class VaultAuthoring
 
         if (protectedFile)
         {
-            var manifestMutation = await BuildManifestAndRegistryMutationsAsync(request.VaultRoot, request.ConfigRoot!, request.RelativePath, request.Content, cancellationToken);
+            var manifestMutation = await BuildManifestAndRegistryMutationsAsync(
+                request.VaultRoot,
+                request.ConfigRoot!,
+                [new ProtectedContentUpdate(request.RelativePath, request.Content, metadata.FileId)],
+                cancellationToken);
             writes.AddRange(manifestMutation);
         }
 
         await ApplyBatchAsync(request.VaultRoot, writes, cancellationToken);
-        var afterBytes = await TrustedFileSystem.ReadAllBytesAsync(request.VaultRoot, request.RelativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
-        return new VaultWriteResult(request.RelativePath, CanonicalHash.Raw(afterBytes), !exists, protectedFile, changedLinks);
+        return new VaultWriteResult(request.RelativePath, CanonicalHash.Raw(Encoding.UTF8.GetBytes(request.Content)), !exists, protectedFile, changedLinks);
     }
 
     public static async Task<InboundLinkInfo> InspectInboundLinksAsync(string vaultRoot, string relativePath, CancellationToken cancellationToken = default)
     {
-        await VerifyVaultAsync(vaultRoot, cancellationToken);
+        return (await InspectInboundLinksWithReadAsync(vaultRoot, relativePath, cancellationToken)).Links;
+    }
+
+    public static async Task<VaultLinkInspection> InspectInboundLinksWithReadAsync(string vaultRoot, string relativePath, CancellationToken cancellationToken = default)
+    {
         EnsureAuthorablePath(relativePath);
-        var content = await TrustedFileSystem.ReadTextAsync(vaultRoot, relativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+        var read = await ReadAsync(vaultRoot, relativePath, cancellationToken);
+        var content = read.Content;
         var id = GetFileId(content, relativePath);
-        var inbound = await ReadInboundAsync(vaultRoot, relativePath, cancellationToken);
+        var inbound = await ReadInboundAsync(vaultRoot, relativePath, content, cancellationToken);
         var hasInbound = InboundFlag.Match(content) is { Success: true } match && string.Equals(match.Groups[1].Value, "true", StringComparison.Ordinal);
         if (hasInbound != (inbound.Count > 0))
         {
             throw new VaultAuthoringException("LINK_METADATA_INCONSISTENT", $"'{relativePath}' has inconsistent hasInboundLinks metadata; repair it before move or deletion.");
         }
 
-        return new InboundLinkInfo(relativePath, id, hasInbound, inbound.OrderBy(value => value, StringComparer.Ordinal).ToArray());
+        return new VaultLinkInspection(read, new InboundLinkInfo(relativePath, id, hasInbound, inbound.OrderBy(value => value, StringComparer.Ordinal).ToArray()));
     }
 
     public static async Task<IReadOnlyList<string>> DeleteAsync(string vaultRoot, string relativePath, string expectedRawSha256, CancellationToken cancellationToken = default)
@@ -131,14 +168,14 @@ public static class VaultAuthoring
             throw new VaultAuthoringException("PROTECTED_DELETE_REQUIRES_LIFECYCLE", "Protected runtime content cannot be deleted through agent authoring.");
         }
 
-        var info = await InspectInboundLinksAsync(vaultRoot, relativePath, cancellationToken);
+        var inspection = await InspectInboundLinksWithReadAsync(vaultRoot, relativePath, cancellationToken);
+        var info = inspection.Links;
         if (info.InboundSources.Count > 0)
         {
             throw new VaultAuthoringException("INBOUND_LINKS_REQUIRE_UPDATE", $"'{relativePath}' has inbound links from: {string.Join(", ", info.InboundSources)}. Update or remove those links before deletion.");
         }
 
-        var bytes = await TrustedFileSystem.ReadAllBytesAsync(vaultRoot, relativePath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
-        if (!string.Equals(CanonicalHash.Raw(bytes), expectedRawSha256, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(inspection.File.RawSha256, expectedRawSha256, StringComparison.OrdinalIgnoreCase))
         {
             throw new VaultAuthoringException("WRITE_PRECONDITION_FAILED", $"Read '{relativePath}' again before deletion.");
         }
@@ -192,8 +229,20 @@ public static class VaultAuthoring
         var purpose = string.IsNullOrWhiteSpace(request.Purpose) ? "Unknown - user input required." : request.Purpose.Trim();
         var goal = string.IsNullOrWhiteSpace(request.EndGoal) ? "Unknown - user input required." : request.EndGoal.Trim();
         var date = DateOnly.FromDateTime(DateTime.Now);
+        var projectId = Guid.NewGuid().ToString("D");
         var files = new Dictionary<string, string>(StringComparer.Ordinal)
         {
+            [$"{basePath}/project.json"] = JsonSerializer.Serialize(new
+            {
+                schema_version = 1,
+                project_id = projectId,
+                project_slug = request.Slug,
+                title = request.Title,
+                storage_mode = "local-private",
+                git_state = "local-private",
+                recent_locations = Array.Empty<string>(),
+                updated_at = now.ToUniversalTime().ToString("O")
+            }, IndentedJson) + "\n",
             [$"{basePath}/index.md"] = ProjectRouter(request.Slug, request.Title, purpose),
             [$"{basePath}/rules/index.md"] = ManagedDocument($"{request.Title} Rules", request.Slug, "index", $"# {request.Title} Rules\n\n## Project-Wide Always Load\n\nNone.\n\n## Rule Categories\n\nCreate a broad subject category before adding a rule.", now),
             [$"{basePath}/context/index.md"] = ManagedDocument($"{request.Title} Context", request.Slug, "index", $"# {request.Title} Context\n\n## Project-Wide Always Load\n\n- [Current State](./current-state.md)  - Current purpose, goal, verified state, and open work.\n\n## Conditional and Historical Context\n\nNone.", now),
@@ -206,13 +255,56 @@ public static class VaultAuthoring
         var rootUpdate = rootIndex.Content.Replace("## Projects", "## Projects\n\n" + projectLink, StringComparison.Ordinal);
         var writes = files.Select(pair => new Mutation(request.VaultRoot, pair.Key, pair.Value, "MISSING")).ToList();
         writes.Add(new Mutation(request.VaultRoot, "index.md", rootUpdate, rootIndex.RawSha256));
-        writes.AddRange(await BuildManifestAndRegistryMutationsAsync(request.VaultRoot, request.ConfigRoot, "index.md", rootUpdate, cancellationToken));
+        var protectedUpdates = new List<ProtectedContentUpdate>
+        {
+            new("index.md", rootUpdate, ManagedDocumentMetadataValidator.Parse("index.md", rootUpdate, requireCompleteSchema: false).FileId)
+        };
+        foreach (var protectedPath in new[]
+        {
+            $"{basePath}/index.md",
+            $"{basePath}/rules/index.md",
+            $"{basePath}/context/index.md",
+            $"{basePath}/context/current-state.md",
+            $"{basePath}/daily/index.md",
+            $"{basePath}/daily/archive/index.md"
+        })
+        {
+            var protectedContent = files[protectedPath];
+            protectedUpdates.Add(new ProtectedContentUpdate(
+                protectedPath,
+                protectedContent,
+                ManagedDocumentMetadataValidator.Parse(protectedPath, protectedContent, requireCompleteSchema: false).FileId));
+        }
+        writes.AddRange(await BuildManifestAndRegistryMutationsAsync(request.VaultRoot, request.ConfigRoot, protectedUpdates, cancellationToken));
         await ApplyBatchAsync(request.VaultRoot, writes, cancellationToken);
-        var current = await TrustedFileSystem.ReadAllBytesAsync(request.VaultRoot, "index.md", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
-        return new ProjectCreateResult(request.Slug, files.Keys.OrderBy(value => value, StringComparer.Ordinal).ToArray(), CanonicalHash.Raw(current));
+        var createdPaths = files.Keys.OrderBy(value => value, StringComparer.Ordinal).ToArray();
+        return new ProjectCreateResult(request.Slug, projectId, createdPaths, createdPaths.Append("index.md").OrderBy(value => value, StringComparer.Ordinal).ToArray(), CanonicalHash.Raw(Encoding.UTF8.GetBytes(rootUpdate)));
     }
 
-    public static async Task<DailyInspection> InspectDailyAsync(string vaultRoot, string project, DateOnly localDate, CancellationToken cancellationToken = default)
+    public static async Task<ProjectInspection> InspectProjectAsync(string vaultRoot, string project, CancellationToken cancellationToken = default)
+    {
+        await VerifyVaultAsync(vaultRoot, cancellationToken);
+        if (!Regex.IsMatch(project, "^[a-z0-9]+(?:-[a-z0-9]+)*$", RegexOptions.CultureInvariant))
+        {
+            throw new VaultAuthoringException("PROJECT_SLUG_INVALID", "Project slug must use lowercase letters, digits, and single hyphens.");
+        }
+
+        var bytes = await TrustedFileSystem.ReadAllBytesAsync(vaultRoot, $"projects/{project}/project.json", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+        using var document = StrictJson.Parse(bytes);
+        var root = document.RootElement;
+        string Required(string name) => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(value.GetString())
+            ? value.GetString()!
+            : throw new VaultAuthoringException("PROJECT_POINTER_INVALID", $"Project pointer has no valid '{name}'.");
+        var projectId = Required("project_id");
+        if (!Guid.TryParse(projectId, out _) || !string.Equals(Required("project_slug"), project, StringComparison.Ordinal))
+        {
+            throw new VaultAuthoringException("PROJECT_POINTER_INVALID", "Project pointer identity does not match the requested project.");
+        }
+
+        return new ProjectInspection(project, projectId, Required("storage_mode"), Required("git_state"), CanonicalHash.Raw(bytes));
+    }
+
+    public static async Task<DailyInspection> InspectDailyAsync(string vaultRoot, string project, DateOnly localDate, string? configRoot = null, CancellationToken cancellationToken = default)
     {
         await VerifyVaultAsync(vaultRoot, cancellationToken);
         var dailyBase = DailyBase(project);
@@ -221,7 +313,11 @@ public static class VaultAuthoring
         TrustedFileSystem.EnsureSupported(pointerTarget);
         if (string.Equals(project, "global", StringComparison.Ordinal) && !File.Exists(pointerTarget.FullPath!))
         {
-            await InitializeGlobalDailyAsync(vaultRoot, localDate, cancellationToken);
+            if (string.IsNullOrWhiteSpace(configRoot))
+            {
+                throw new VaultAuthoringException("GLOBAL_DAILY_CONFIG_REQUIRED", "Creating the global daily stream requires the configuration root so its mandatory files can be integrity-protected.");
+            }
+            await InitializeGlobalDailyAsync(vaultRoot, configRoot, localDate, cancellationToken);
         }
         var content = await TrustedFileSystem.ReadTextAsync(vaultRoot, pointer, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
         var match = Regex.Match(content, @"\./active/(?<date>\d{4}-\d{2}-\d{2})\.md", RegexOptions.CultureInvariant);
@@ -235,14 +331,14 @@ public static class VaultAuthoring
         return new DailyInspection(project, active, CanonicalHash.Raw(bytes), CanonicalHash.DecodeUtf8(bytes), activeDate, activeDate != localDate);
     }
 
-    public static async Task<IReadOnlyList<string>> RolloverDailyAsync(string vaultRoot, string project, DateOnly localDate, string expectedActiveRawSha256, bool promotionsComplete, CancellationToken cancellationToken = default)
+    public static async Task<IReadOnlyList<string>> RolloverDailyAsync(string vaultRoot, string configRoot, string project, DateOnly localDate, string expectedActiveRawSha256, bool promotionsComplete, CancellationToken cancellationToken = default)
     {
         if (!promotionsComplete)
         {
             throw new VaultAuthoringException("PROMOTIONS_CONFIRMATION_REQUIRED", "Read the entire previous daily note, make explicit rule/context/current-state promotions, then pass --promotions-complete true.");
         }
 
-        var daily = await InspectDailyAsync(vaultRoot, project, localDate, cancellationToken);
+        var daily = await InspectDailyAsync(vaultRoot, project, localDate, configRoot, cancellationToken);
         if (!daily.RolloverRequired)
         {
             return [];
@@ -260,28 +356,39 @@ public static class VaultAuthoring
         var yearIndex = $"{dailyBase}/daily/archive/{daily.ActiveDate:yyyy}/index.md";
         var monthIndex = $"{dailyBase}/daily/archive/{daily.ActiveDate:yyyy}/{daily.ActiveDate:MMM}/index.md";
         var pointer = $"{dailyBase}/daily/index.md";
-        var pointerContent = await TrustedFileSystem.ReadTextAsync(vaultRoot, pointer, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
-        var pointerRaw = CanonicalHash.Raw(await TrustedFileSystem.ReadAllBytesAsync(vaultRoot, pointer, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken));
+        var pointerBytes = await TrustedFileSystem.ReadAllBytesAsync(vaultRoot, pointer, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+        var pointerContent = CanonicalHash.DecodeUtf8(pointerBytes);
+        var pointerRaw = CanonicalHash.Raw(pointerBytes);
         var newPointer = new Regex(@"\./active/\d{4}-\d{2}-\d{2}\.md", RegexOptions.CultureInvariant).Replace(pointerContent, $"./active/{localDate:yyyy-MM-dd}.md", 1);
-        var archiveRaw = await RawOrMissingAsync(vaultRoot, archiveIndex, cancellationToken);
-        var yearRaw = await RawOrMissingAsync(vaultRoot, yearIndex, cancellationToken);
-        var monthRaw = await RawOrMissingAsync(vaultRoot, monthIndex, cancellationToken);
-        var archiveContent = archiveRaw == "MISSING" ? ManagedDocument($"{project} Daily Archive", project, "index", "# Daily Archive", DateTimeOffset.UtcNow) : EnsureBullet(await TryReadAsync(vaultRoot, archiveIndex, cancellationToken), $"- [{daily.ActiveDate:yyyy}](./{daily.ActiveDate:yyyy}/index.md)");
-        var yearContent = yearRaw == "MISSING" ? ManagedDocument($"{project} {daily.ActiveDate:yyyy} Daily Archive", project, "index", $"# {daily.ActiveDate:yyyy}", DateTimeOffset.UtcNow) : EnsureBullet(await TryReadAsync(vaultRoot, yearIndex, cancellationToken), $"- [{daily.ActiveDate:MMM}](./{daily.ActiveDate:MMM}/index.md)");
-        var monthContent = monthRaw == "MISSING" ? ManagedDocument($"{project} {daily.ActiveDate:MMM} {daily.ActiveDate:yyyy} Daily Archive", project, "index", $"# {daily.ActiveDate:MMM} {daily.ActiveDate:yyyy}", DateTimeOffset.UtcNow) : EnsureBullet(await TryReadAsync(vaultRoot, monthIndex, cancellationToken), $"- [{daily.ActiveDate:dd}](./{daily.ActiveDate:dd}.md)  - Archived daily handoff.");
+        var archiveState = await ReadOptionalAsync(vaultRoot, archiveIndex, cancellationToken);
+        var yearState = await ReadOptionalAsync(vaultRoot, yearIndex, cancellationToken);
+        var monthState = await ReadOptionalAsync(vaultRoot, monthIndex, cancellationToken);
+        var archiveContent = archiveState.Content is null ? ManagedDocument($"{project} Daily Archive", project, "index", "# Daily Archive", DateTimeOffset.UtcNow) : EnsureBullet(archiveState.Content, $"- [{daily.ActiveDate:yyyy}](./{daily.ActiveDate:yyyy}/index.md)");
+        var yearContent = yearState.Content is null ? ManagedDocument($"{project} {daily.ActiveDate:yyyy} Daily Archive", project, "index", $"# {daily.ActiveDate:yyyy}", DateTimeOffset.UtcNow) : EnsureBullet(yearState.Content, $"- [{daily.ActiveDate:MMM}](./{daily.ActiveDate:MMM}/index.md)");
+        var monthContent = monthState.Content is null ? ManagedDocument($"{project} {daily.ActiveDate:MMM} {daily.ActiveDate:yyyy} Daily Archive", project, "index", $"# {daily.ActiveDate:MMM} {daily.ActiveDate:yyyy}", DateTimeOffset.UtcNow) : EnsureBullet(monthState.Content, $"- [{daily.ActiveDate:dd}](./{daily.ActiveDate:dd}.md)  - Archived daily handoff.");
         archiveContent = EnsureBullet(archiveContent, $"- [{daily.ActiveDate:yyyy}](./{daily.ActiveDate:yyyy}/index.md)");
         yearContent = EnsureBullet(yearContent, $"- [{daily.ActiveDate:MMM}](./{daily.ActiveDate:MMM}/index.md)");
         monthContent = EnsureBullet(monthContent, $"- [{daily.ActiveDate:dd}](./{daily.ActiveDate:dd}.md)  - Archived daily handoff.");
+        var newActive = $"{dailyBase}/daily/active/{localDate:yyyy-MM-dd}.md";
+        var newActiveContent = DailyNote(project, title, localDate, DateTimeOffset.UtcNow);
         var writes = new List<Mutation>
         {
             new(vaultRoot, archive, daily.ActiveContent, "MISSING"),
-            new(vaultRoot, $"{dailyBase}/daily/active/{localDate:yyyy-MM-dd}.md", DailyNote(project, title, localDate, DateTimeOffset.UtcNow), "MISSING"),
+            new(vaultRoot, newActive, newActiveContent, "MISSING"),
             new(vaultRoot, pointer, newPointer, pointerRaw),
-            new(vaultRoot, archiveIndex, archiveContent, archiveRaw),
-            new(vaultRoot, yearIndex, yearContent, yearRaw),
-            new(vaultRoot, monthIndex, monthContent, monthRaw),
+            new(vaultRoot, archiveIndex, archiveContent, archiveState.RawSha256),
+            new(vaultRoot, yearIndex, yearContent, yearState.RawSha256),
+            new(vaultRoot, monthIndex, monthContent, monthState.RawSha256),
             new(vaultRoot, daily.ActiveRelativePath, null, daily.ActiveRawSha256)
         };
+        var protectedUpdates = new[]
+        {
+            ProtectedUpdate(pointer, newPointer),
+            ProtectedUpdate(archiveIndex, archiveContent),
+            ProtectedUpdate(yearIndex, yearContent),
+            ProtectedUpdate(monthIndex, monthContent)
+        };
+        writes.AddRange(await BuildManifestAndRegistryMutationsAsync(vaultRoot, configRoot, protectedUpdates, [daily.ActiveRelativePath], cancellationToken));
         await ApplyBatchAsync(vaultRoot, writes, cancellationToken);
         return writes.Select(write => write.Path).OrderBy(value => value, StringComparer.Ordinal).ToArray();
     }
@@ -342,25 +449,82 @@ public static class VaultAuthoring
         File.Delete(target.FullPath!);
     }
 
-    private static async Task<IReadOnlyList<Mutation>> BuildManifestAndRegistryMutationsAsync(string vaultRoot, string configRoot, string path, string content, CancellationToken cancellationToken)
+    private sealed record ProtectedContentUpdate(string Path, string Content, string FileId);
+
+    private static async Task<IReadOnlyList<Mutation>> BuildManifestAndRegistryMutationsAsync(
+        string vaultRoot,
+        string configRoot,
+        IReadOnlyList<ProtectedContentUpdate> updates,
+        IReadOnlyList<string>? removals,
+        CancellationToken cancellationToken)
     {
         var manifestPath = ".vault-system/content-integrity.json";
         var manifestBytes = await TrustedFileSystem.ReadAllBytesAsync(vaultRoot, manifestPath, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
         using var strict = StrictJson.Parse(manifestBytes);
         var root = JsonNode.Parse(strict.RootElement.GetRawText())!.AsObject();
         var files = root["files"]?.AsArray() ?? throw new VaultAuthoringException("INTEGRITY_MANIFEST_INVALID", "Integrity manifest has no files array.");
-        var entry = files.OfType<JsonObject>().SingleOrDefault(node => string.Equals(node["path"]?.GetValue<string>(), path, StringComparison.Ordinal));
-        if (entry is null)
+        removals ??= [];
+        if ((updates.Count == 0 && removals.Count == 0) ||
+            updates.Select(update => update.Path).Distinct(StringComparer.Ordinal).Count() != updates.Count ||
+            removals.Distinct(StringComparer.Ordinal).Count() != removals.Count ||
+            updates.Select(update => update.Path).Intersect(removals, StringComparer.Ordinal).Any())
         {
-            throw new VaultAuthoringException("INTEGRITY_ENTRY_MISSING", $"Protected path '{path}' is absent from the integrity manifest.");
+            throw new VaultAuthoringException("INTEGRITY_UPDATE_INVALID", "Protected-content updates and removals must be unique and disjoint.");
         }
 
-        entry["sha256"] = CanonicalHash.Text(content).ToUpperInvariant();
-        entry["revision"] = (entry["revision"]?.GetValue<int>() ?? 0) + 1;
-        entry["change_origin"] = "agent";
-        entry["changed_at"] = DateTimeOffset.UtcNow.ToString("O");
+        var now = DateTimeOffset.UtcNow;
+        foreach (var removal in removals)
+        {
+            var matches = files.OfType<JsonObject>().Where(node => string.Equals(node["path"]?.GetValue<string>(), removal, StringComparison.Ordinal)).ToArray();
+            if (matches.Length > 1)
+            {
+                throw new VaultAuthoringException("INTEGRITY_MANIFEST_INVALID", $"Protected path '{removal}' has duplicate integrity entries.");
+            }
+            if (matches.Length == 0)
+            {
+                continue;
+            }
+            files.Remove(matches[0]);
+        }
+        foreach (var update in updates)
+        {
+            var matches = files.OfType<JsonObject>()
+                .Where(node => string.Equals(node["path"]?.GetValue<string>(), update.Path, StringComparison.Ordinal))
+                .ToArray();
+            if (matches.Length > 1)
+            {
+                throw new VaultAuthoringException("INTEGRITY_MANIFEST_INVALID", $"Protected path '{update.Path}' has duplicate integrity entries.");
+            }
+
+            var entry = matches.SingleOrDefault();
+            if (entry is null)
+            {
+                entry = new JsonObject
+                {
+                    ["file_id"] = update.FileId,
+                    ["path"] = update.Path,
+                    ["sha256"] = CanonicalHash.Text(update.Content).ToUpperInvariant(),
+                    ["revision"] = 1,
+                    ["change_origin"] = "agent-authorized",
+                    ["changed_at"] = now.ToString("O")
+                };
+                files.Add(entry);
+                continue;
+            }
+
+            entry["sha256"] = CanonicalHash.Text(update.Content).ToUpperInvariant();
+            entry["revision"] = (entry["revision"]?.GetValue<int>() ?? 0) + 1;
+            entry["change_origin"] = "agent-authorized";
+            entry["changed_at"] = now.ToString("O");
+        }
+        var orderedEntries = files.OfType<JsonObject>()
+            .OrderBy(entry => entry["path"]?.GetValue<string>(), StringComparer.Ordinal)
+            .Select(entry => (JsonNode)entry.DeepClone())
+            .ToArray();
+        files.Clear();
+        foreach (var entry in orderedEntries) { files.Add(entry); }
         root["revision"] = (root["revision"]?.GetValue<int>() ?? 0) + 1;
-        root["updated_at"] = DateTimeOffset.UtcNow.ToString("O");
+        root["updated_at"] = now.ToString("O");
         var manifest = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n";
         var vaultId = root["vault_id"]?.GetValue<string>() ?? throw new VaultAuthoringException("INTEGRITY_MANIFEST_INVALID", "Integrity manifest has no vault_id.");
         var registryPath = "vault-registry.json";
@@ -376,17 +540,50 @@ public static class VaultAuthoring
         }
 
         registryEntry["protected_content_manifest_sha256"] = CanonicalHash.Text(manifest).ToUpperInvariant();
-        registryEntry["last_verified_at"] = DateTimeOffset.UtcNow.ToString("O");
-        registry["updated_at"] = DateTimeOffset.UtcNow.ToString("O");
+        registryEntry["last_verified_at"] = now.ToString("O");
+        registry["updated_at"] = now.ToString("O");
         var registryText = registry.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n";
         return [new Mutation(vaultRoot, manifestPath, manifest, CanonicalHash.Raw(manifestBytes)), new Mutation(configRoot, registryPath, registryText, CanonicalHash.Raw(registryBytes))];
     }
 
+    private static Task<IReadOnlyList<Mutation>> BuildManifestAndRegistryMutationsAsync(
+        string vaultRoot,
+        string configRoot,
+        IReadOnlyList<ProtectedContentUpdate> updates,
+        CancellationToken cancellationToken)
+        => BuildManifestAndRegistryMutationsAsync(vaultRoot, configRoot, updates, [], cancellationToken);
+
+    private static ProtectedContentUpdate ProtectedUpdate(string path, string content) => new(
+        path,
+        content,
+        ManagedDocumentMetadataValidator.Parse(path, content, requireCompleteSchema: false).FileId);
+
     private static async Task<bool> IsProtectedAsync(string root, string path, CancellationToken cancellationToken)
+    {
+        return (await ReadProtectedHashesAsync(root, cancellationToken)).ContainsKey(path);
+    }
+
+    private static async Task<IReadOnlyDictionary<string, string>> ReadProtectedHashesAsync(string root, CancellationToken cancellationToken)
     {
         var manifest = await TrustedFileSystem.ReadAllBytesAsync(root, ".vault-system/content-integrity.json", SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
         using var document = StrictJson.Parse(manifest);
-        return document.RootElement.TryGetProperty("files", out var files) && files.ValueKind == JsonValueKind.Array && files.EnumerateArray().Any(entry => entry.TryGetProperty("path", out var value) && string.Equals(value.GetString(), path, StringComparison.Ordinal));
+        if (!document.RootElement.TryGetProperty("files", out var files) || files.ValueKind != JsonValueKind.Array)
+        {
+            throw new VaultAuthoringException("INTEGRITY_MANIFEST_INVALID", "Integrity manifest has no files array.");
+        }
+
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var entry in files.EnumerateArray())
+        {
+            if (!entry.TryGetProperty("path", out var path) || path.ValueKind != JsonValueKind.String ||
+                !entry.TryGetProperty("sha256", out var hash) || hash.ValueKind != JsonValueKind.String ||
+                string.IsNullOrWhiteSpace(path.GetString()) || string.IsNullOrWhiteSpace(hash.GetString()) ||
+                !result.TryAdd(path.GetString()!, hash.GetString()!))
+            {
+                throw new VaultAuthoringException("INTEGRITY_MANIFEST_INVALID", "Integrity manifest contains an invalid or duplicate file entry.");
+            }
+        }
+        return result;
     }
 
     private static async Task VerifyVaultAsync(string vaultRoot, CancellationToken cancellationToken)
@@ -401,42 +598,20 @@ public static class VaultAuthoring
 
     private static void EnsureAuthorablePath(string path)
     {
-        var validation = SafePath.ValidateRelative(Path.GetTempPath(), path, SafePathProfile.PrivateConfig); TrustedFileSystem.EnsureSupported(validation);
+        EnsureReadablePath(path);
         if (!path.EndsWith(".md", StringComparison.OrdinalIgnoreCase) || path.StartsWith(".vault-system/", StringComparison.Ordinal) || path.StartsWith(".agents/", StringComparison.Ordinal))
         {
             throw new VaultAuthoringException("VAULT_AUTHOR_PATH_DENIED", "Vault authoring supports managed Markdown outside .vault-system and repository .agents. Use the dedicated repository adapter for .agents.");
         }
     }
 
-    private static void ValidateMarkdown(string path, string content)
+    private static void EnsureReadablePath(string path)
     {
-        if (!content.StartsWith("---\n", StringComparison.Ordinal))
+        var validation = SafePath.ValidateRelative(Path.GetTempPath(), path, SafePathProfile.PrivateConfig);
+        TrustedFileSystem.EnsureSupported(validation);
+        if (!path.EndsWith(".md", StringComparison.OrdinalIgnoreCase) || path.StartsWith(".agents/", StringComparison.Ordinal))
         {
-            throw new VaultAuthoringException("MANAGED_FRONTMATTER_REQUIRED", $"'{path}' must begin with deterministic managed frontmatter.");
-        }
-
-        var end = content.IndexOf("\n---\n", 4, StringComparison.Ordinal); if (end < 0)
-        {
-            throw new VaultAuthoringException("MANAGED_FRONTMATTER_REQUIRED", $"'{path}' has no closing managed frontmatter delimiter.");
-        }
-
-        var metadata = StrictYaml.ParseFrontmatter(content[4..end]);
-        foreach (var key in new[] { "file_id", "title", "kind", "status", "aliases", "hasInboundLinks" })
-        {
-            if (!metadata.ContainsKey(key))
-            {
-                throw new VaultAuthoringException("MANAGED_FRONTMATTER_INVALID", $"'{path}' is missing frontmatter key '{key}'.");
-            }
-        }
-
-        if (metadata["file_id"] is not string id || !Guid.TryParse(id, out _))
-        {
-            throw new VaultAuthoringException("MANAGED_FRONTMATTER_INVALID", $"'{path}' has no UUID file_id.");
-        }
-
-        if (metadata["hasInboundLinks"] is not bool)
-        {
-            throw new VaultAuthoringException("MANAGED_FRONTMATTER_INVALID", $"'{path}' has an invalid hasInboundLinks value.");
+            throw new VaultAuthoringException("VAULT_READ_PATH_DENIED", "Private-vault reads support managed Markdown. Repository .agents content must use the dedicated repository command.");
         }
     }
 
@@ -471,6 +646,11 @@ public static class VaultAuthoring
     private static async Task<HashSet<string>> ReadInboundAsync(string root, string target, CancellationToken cancellationToken)
     {
         var content = await TrustedFileSystem.ReadTextAsync(root, target, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+        return await ReadInboundAsync(root, target, content, cancellationToken);
+    }
+
+    private static async Task<HashSet<string>> ReadInboundAsync(string root, string target, string content, CancellationToken cancellationToken)
+    {
         var id = GetFileId(content, target); var sidecar = $".vault-system/references/{id}.json";
         var location = SafePath.ValidateRelative(root, sidecar, SafePathProfile.PrivateConfig); TrustedFileSystem.EnsureSupported(location);
         if (!File.Exists(location.FullPath!))
@@ -511,18 +691,28 @@ public static class VaultAuthoring
     private static string DailyIndex(string project, string title, DateOnly date, DateTimeOffset now) => ManagedDocument($"{title} Daily Notes", project, "index", $"# {title} Daily Notes\n\n## Current Active Note\n\nPolicy: `always` for active work in this project.\n\n[{date:yyyy-MM-dd}](./active/{date:yyyy-MM-dd}.md)\n\n## Archive\n\n[Archive Index](./archive/index.md)", now);
     private static string DailyNote(string project, string title, DateOnly date, DateTimeOffset now) => ManagedDocument($"{date:yyyy-MM-dd} - {title}", project, "daily", $"# {date:yyyy-MM-dd} - {title}\n\n## Current Handoff\n\n- Objective:\n- Current state:\n- Next action:\n- Blockers:\n- Relevant rules:\n- Relevant context:\n\n## Sessions\n", now);
     private static string DailyBase(string project) => string.Equals(project, "global", StringComparison.Ordinal) ? "global" : $"projects/{project}";
-    private static async Task InitializeGlobalDailyAsync(string vaultRoot, DateOnly localDate, CancellationToken cancellationToken)
+    private static async Task InitializeGlobalDailyAsync(string vaultRoot, string configRoot, DateOnly localDate, CancellationToken cancellationToken)
     {
         var now = DateTimeOffset.UtcNow;
-        var writes = new[]
+        var content = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            new Mutation(vaultRoot, "global/daily/index.md", DailyIndex("global", "Global", localDate, now), "MISSING"),
-            new Mutation(vaultRoot, $"global/daily/active/{localDate:yyyy-MM-dd}.md", DailyNote("global", "Global", localDate, now), "MISSING"),
-            new Mutation(vaultRoot, "global/daily/archive/index.md", ManagedDocument("Global Daily Archive", "global", "index", "# Global Daily Archive\n\nNo archived daily notes.", now), "MISSING")
+            ["global/daily/index.md"] = DailyIndex("global", "Global", localDate, now),
+            [$"global/daily/active/{localDate:yyyy-MM-dd}.md"] = DailyNote("global", "Global", localDate, now),
+            ["global/daily/archive/index.md"] = ManagedDocument("Global Daily Archive", "global", "index", "# Global Daily Archive\n\nNo archived daily notes.", now)
         };
+        var writes = content.Select(pair => new Mutation(vaultRoot, pair.Key, pair.Value, "MISSING")).ToList();
+        var protectedContent = content.Where(pair => pair.Key.EndsWith("/index.md", StringComparison.Ordinal)).Select(pair => ProtectedUpdate(pair.Key, pair.Value)).ToArray();
+        writes.AddRange(await BuildManifestAndRegistryMutationsAsync(vaultRoot, configRoot, protectedContent, cancellationToken));
         await ApplyBatchAsync(vaultRoot, writes, cancellationToken);
     }
-    private static async Task<string> TryReadAsync(string root, string path, CancellationToken ct) { var target = SafePath.ValidateRelative(root, path, SafePathProfile.PrivateConfig); TrustedFileSystem.EnsureSupported(target); return File.Exists(target.FullPath!) ? await TrustedFileSystem.ReadTextAsync(root, path, SafePathProfile.PrivateConfig, cancellationToken: ct) : "# Daily Archive\n"; }
-    private static async Task<string> RawOrMissingAsync(string root, string path, CancellationToken ct) { var target = SafePath.ValidateRelative(root, path, SafePathProfile.PrivateConfig); TrustedFileSystem.EnsureSupported(target); return File.Exists(target.FullPath!) ? CanonicalHash.Raw(await TrustedFileSystem.ReadAllBytesAsync(root, path, SafePathProfile.PrivateConfig, cancellationToken: ct)) : "MISSING"; }
+    private sealed record OptionalContent(string? Content, string RawSha256);
+    private static async Task<OptionalContent> ReadOptionalAsync(string root, string path, CancellationToken cancellationToken)
+    {
+        var target = SafePath.ValidateRelative(root, path, SafePathProfile.PrivateConfig);
+        TrustedFileSystem.EnsureSupported(target);
+        if (!File.Exists(target.FullPath!)) { return new(null, "MISSING"); }
+        var bytes = await TrustedFileSystem.ReadAllBytesAsync(root, path, SafePathProfile.PrivateConfig, cancellationToken: cancellationToken);
+        return new(CanonicalHash.DecodeUtf8(bytes), CanonicalHash.Raw(bytes));
+    }
     private static string EnsureBullet(string content, string bullet) => content.Contains(bullet, StringComparison.Ordinal) ? content : content.TrimEnd() + "\n\n" + bullet + "\n";
 }

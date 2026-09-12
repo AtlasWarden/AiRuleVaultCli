@@ -6,5 +6,6 @@
   <ItemGroup>
     <ProjectReference Include="..\RuleVault.Core\RuleVault.Core.csproj" />
     <ProjectReference Include="..\RuleVault.Storage\RuleVault.Storage.csproj" />
+    <ProjectReference Include="..\RuleVault.Agents\RuleVault.Agents.csproj" />
   </ItemGroup>
 </Project>

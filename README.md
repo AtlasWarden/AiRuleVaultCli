@@ -1,17 +1,41 @@
-# Rule Vault CLI
+# Rule Vault
 
-This repository contains the compiled Rule Vault CLI and its modular storage, installation,
-agent, and command-line layers. The installer source and runtime payload remain in the
-`AiRuleVault` repository.
+Rule Vault is a local rules and context store for AI agents. The bundled CLI keeps
+the vault location private, verifies protected content, coordinates concurrent agent
+sessions, manages project and daily files, and safely reads or writes Git `.agents`
+content.
 
-The Windows release provides mediated vault authoring, migration/install planning, Git-gated
-repository `.agents` access, opaque agent sessions with freshness hashes and token accounting,
-and an optional bounded bootstrap manager for known user-level agent configuration paths.
+## Install on Windows
 
-Use `rv agent capabilities --format json` for the agent-facing contract. Human users can choose
-`--format text`, `json`, or `table`, and can export a response with `--output-file <path>`.
-Bootstrap discovery is reviewable before mutation: `rv agents bootstrap discover`, then
-`rv agents bootstrap apply --adapter <id>` or `--all true`. Missing directories, ambiguous legacy
-content, and conflicting ownership markers are left unchanged.
+Extract `artifacts/RuleVault-0.1.0-dev-win-x64.zip`, open PowerShell in that folder,
+and run:
 
-Development and automated validation use synthetic fixtures and disposable temporary roots.
+```powershell
+.\install.ps1
+```
+
+Press Enter to accept recommended choices, or use the number/arrow-key menus. The
+installer handles new installs, updates, migrations, and archive-backed integrity
+repair. It never changes an existing vault or agent bootstrap without approval.
+
+## Use
+
+Run `rv --help` for human commands. Agents discover the installed executable from
+`%LOCALAPPDATA%\AI-Rule-Vault\rule-vault-cli.json`, then call `agent capabilities`,
+`agent register`, and the required `agent context` startup command before other
+opaque agent operations.
+
+Commands support `--format text`, `--format json`, or `--format table`, plus
+`--output-file <path>` for exports.
+
+## Build and test
+
+Requires the .NET SDK selected by `global.json` and PowerShell 7.
+
+```powershell
+.\build\build.ps1 -Target verify
+.\build\create-package.ps1
+```
+
+The second command creates `InstallerPackage` and the self-contained Windows release
+ZIP under `artifacts`.

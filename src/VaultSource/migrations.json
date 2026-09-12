@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "id": "runtime-core-v1",
+      "from": "global/operating-rules.md",
+      "to": "global/core-runtime.md",
+      "kind": "vendor-alias",
+      "requires_exact_prior_base": true
+    },
+    {
+      "id": "write-safety-v1",
+      "from": ".vault-system/write-safety.md",
+      "to": "global/write-safety.md",
+      "kind": "vendor-alias",
+      "requires_exact_prior_base": true
+    }
+  ]
+}

@@ -67,6 +67,7 @@ public sealed class AdapterTests
         var bootstrap = OwnedMarkdownBlock.Bootstrap("claude-code", "rv");
 
         Assert.True(System.Text.Encoding.UTF8.GetByteCount(bootstrap) <= 2000);
+        Assert.Contains("required agent context startup", bootstrap, StringComparison.Ordinal);
         Assert.Contains("does not permit bypassing", bootstrap, StringComparison.Ordinal);
     }
 

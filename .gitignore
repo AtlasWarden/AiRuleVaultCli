@@ -4,5 +4,6 @@
 .idea/
 artifacts/
 TestResults/
+Installer/
 *.user
 *.suo

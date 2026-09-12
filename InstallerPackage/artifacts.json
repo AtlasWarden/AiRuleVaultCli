@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "package_version": "0.1.0-dev",
+  "artifacts": [
+    {
+      "rid": "win-x64",
+      "relative_path": "bin/win-x64/rv.exe",
+      "raw_sha256": "352D7F6B9428FDD1A3B0FB1D29DD3AFC35511D1644AED037954A5943CB49C910",
+      "size": 77443799,
+      "tested": true
+    }
+  ],
+  "package_files": [
+    {
+      "relative_path": "guide.md",
+      "raw_sha256": "27082738A31E584977D027A801D7FCB70908EB16D4C549E2BFF3C21DEF862396",
+      "size": 5604
+    },
+    {
+      "relative_path": "install.ps1",
+      "raw_sha256": "CC7D0FE34E3C02F8DD28ADFFD1629BAD7F60771EEBB5FC976DE23D5BDF7C011D",
+      "size": 32849
+    },
+    {
+      "relative_path": "install.sh",
+      "raw_sha256": "53F99C70C21E5B0F8B73BB52163E0718F197A908A9DBEF3A09F67B08AD576143",
+      "size": 711
+    },
+    {
+      "relative_path": "migrations.json",
+      "raw_sha256": "442DC011D2546ECC25151B8C98E0F5468FCE47EB72C0D4E3EC0AED349E0C90C4",
+      "size": 437
+    },
+    {
+      "relative_path": "package.json",
+      "raw_sha256": "F8E0A5E63FF6C4F99DD00286349EDBE32962E38A0F1B09F90D85485913AD3B67",
+      "size": 574
+    },
+    {
+      "relative_path": "runtime-payload/.vault-system/routes.json",
+      "raw_sha256": "FA33D96238C36311F97EF93960709764F4416C6016ED80F01AB508DA154C18EE",
+      "size": 3762
+    },
+    {
+      "relative_path": "runtime-payload/.vault-system/validation-and-remediation.md",
+      "raw_sha256": "9DAA255B94DC422D38DCE93F0AE794DF3C87D624E14E7154FBE58B9A8F669F87",
+      "size": 34427
+    },
+    {
+      "relative_path": "runtime-payload/global/conformance.md",
+      "raw_sha256": "D7BDFF07AA835A4038BDA8779C0DD210C42DAE1296F36FFB4B494ABC23155A18",
+      "size": 14053
+    },
+    {
+      "relative_path": "runtime-payload/global/core-runtime.md",
+      "raw_sha256": "7CDCCEA3BDEE9B7EB884B75DAB3C8FCA9D10EA005670F25E67F86B277FD76A8E",
+      "size": 40529
+    },
+    {
+      "relative_path": "runtime-payload/global/daily-continuity.md",
+      "raw_sha256": "4354079C27CA4165C853651D9D805DCA8D9BEF5BC08A1A663211C3A7D3052AA5",
+      "size": 10786
+    },
+    {
+      "relative_path": "runtime-payload/global/file-and-context-management.md",
+      "raw_sha256": "1692E4AF241EB942B5378DE5C96E8032540D8BE5BDEAA9A2DB7B58AB212BEDFF",
+      "size": 38155
+    },
+    {
+      "relative_path": "runtime-payload/global/project-management.md",
+      "raw_sha256": "931EACFC60B5FE5FF5B5D66AF5FDDDD5C776F03CBB37DFA78086B9057266FB82",
+      "size": 34531
+    },
+    {
+      "relative_path": "runtime-payload/global/vault-discovery-and-integrity.md",
+      "raw_sha256": "FBDE52D0259079140642B3FECECDDC1F8617FC8345E8CCD39CA78784CDE18640",
+      "size": 2659
+    },
+    {
+      "relative_path": "runtime-payload/global/write-safety.md",
+      "raw_sha256": "B02F7DF4DFC15B71FAAFA9093F076C8887AA5ADD3DB519E43299F73D6E92094B",
+      "size": 22624
+    },
+    {
+      "relative_path": "runtime-payload/index.md",
+      "raw_sha256": "F45DE7A79ABD860BD43E2618F582641EEF64D76CD30CBF59E0C3FCDA681797E0",
+      "size": 1782
+    }
+  ]
+}
