@@ -5,7 +5,7 @@
     {
       "rid": "win-x64",
       "relative_path": "bin/win-x64/rv.exe",
-      "raw_sha256": "352D7F6B9428FDD1A3B0FB1D29DD3AFC35511D1644AED037954A5943CB49C910",
+      "raw_sha256": "6094686C8848E82941A4D0898E350910CE5C477E042E0EF69354919D44DAD1BB",
       "size": 77443799,
       "tested": true
     }
@@ -18,8 +18,8 @@
     },
     {
       "relative_path": "install.ps1",
-      "raw_sha256": "CC7D0FE34E3C02F8DD28ADFFD1629BAD7F60771EEBB5FC976DE23D5BDF7C011D",
-      "size": 32849
+      "raw_sha256": "4E040C35B9B93BE17C9319A9A362568DBFB1F28CA6851BA66F6691A3DAD0C052",
+      "size": 34975
     },
     {
       "relative_path": "install.sh",

@@ -1,11 +1,12 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('verify', 'publish')]
     [string] $Target = 'verify',
     [ValidateSet('Debug', 'Release')]
     [string] $Configuration = 'Release',
     [string] $Rid = 'win-x64',
-    [string] $OutputDirectory
+    [string] $OutputDirectory,
+    [switch] $SkipTests
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +22,12 @@ function Resolve-OwnedBuildPath([string] $Candidate, [string] $OwnedRoot, [strin
     return $resolved
 }
 
+# dotnet locates global.json from the current working directory. Build from the
+# repository root regardless of where PowerShell was launched, then restore the
+# caller's location on every return or failure.
+Push-Location -LiteralPath $repoRoot
+try {
+
 # Progress Bar Update - Stage 2: Compiling Code
 Write-Progress -Activity "Building Installer Package" -Status "Restoring solution dependencies..." -PercentComplete 20
 
@@ -34,9 +41,13 @@ dotnet build $solution --configuration $Configuration --no-restore -p:Continuous
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Progress -Activity "Building Installer Package" -Status "Running test fixtures..." -PercentComplete 60
-Write-Host "  ⚙  [3/4] Running tests for solution: $solution" -ForegroundColor Cyan
-dotnet test $solution --configuration $Configuration --no-restore | Out-Host
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($SkipTests) {
+    Write-Host "  ⚙  [3/4] Tests skipped (use create-package.ps1 -RunTests to include them)." -ForegroundColor DarkGray
+} else {
+    Write-Host "  ⚙  [3/4] Running tests for solution: $solution" -ForegroundColor Cyan
+    dotnet test $solution --configuration $Configuration --no-restore | Out-Host
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 
 if ($Target -eq 'publish') {
     if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
@@ -55,3 +66,6 @@ if ($Target -eq 'publish') {
     return $OutputDirectory
 }
 return $null
+} finally {
+    Pop-Location
+}

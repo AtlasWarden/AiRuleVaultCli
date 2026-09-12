@@ -13,7 +13,7 @@ namespace RuleVault.Cli;
 /// session basis digest.
 /// </summary>
 public sealed record AgentRegistrationResult(string SessionId, string FriendlyName, string Project, string Freshness, DateTimeOffset RegisteredAtUtc, bool StartupRequired, IReadOnlyList<string> RequiredStartupSequence);
-public sealed record AgentContextResult(ContextPacket Packet, string TaskFingerprint, string BasisHash, int BasisFileCount, int ReadTokens, bool StartupComplete);
+public sealed record AgentContextResult(ContextPacket Packet, string TaskFingerprint, string BasisHash, int BasisFileCount, int ReadTokens, bool StartupComplete, string Delivery = "full");
 public sealed record AgentReadResult(string RelativePath, string Content, string RawSha256, string BasisHash, int BasisFileCount, int ReadTokens, bool RequiresAdditionalRefresh, IReadOnlyList<string> StalePaths);
 public sealed record AgentBatchReadResult(IReadOnlyList<VaultReadResult> Files, string BasisHash, int BasisFileCount, int ReadTokens, bool RequiresAdditionalRefresh, IReadOnlyList<string> StalePaths);
 public sealed record AgentWriteResult(string RelativePath, string RawSha256, int WriteTokens, IReadOnlyList<string> InvalidatedPaths);
@@ -41,6 +41,7 @@ public static class AgentSessions
 {
     private const string StateFile = "agent-sessions.json";
     private static readonly JsonSerializerOptions StateJson = new() { WriteIndented = true };
+    internal static int CountOutputTokens(string content) => Tokenizer.CountTokens(content);
     private static readonly TiktokenTokenizer Tokenizer = TiktokenTokenizer.CreateForEncoding("cl100k_base");
 
     public static string ResolveConfigRoot(string? explicitConfigRoot)
@@ -92,6 +93,7 @@ public static class AgentSessions
             // a caller deliberately reuses an earlier session identifier.
             session.StartupCompletedAtUtc = null;
             session.StartupTaskFingerprint = null;
+            session.LastContextBodySha256 = null;
             session.StartupOperation = null;
             session.StartupSubjects.Clear();
             session.StartupPaths.Clear();
@@ -117,6 +119,7 @@ public static class AgentSessions
         bool includeHistory,
         int optionalBudgetChars,
         int? maxTotalChars,
+        string? knownContextSha256 = null,
         CancellationToken cancellationToken = default)
     {
         ValidateIdentity(sessionId, "session id");
@@ -126,6 +129,12 @@ public static class AgentSessions
             var session = state.Require(sessionId);
             var descriptor = TaskDescriptor.Create(session.Project, operation, subjects, paths, audience, includeHistory, optionalBudgetChars);
             var context = await VaultInspector.BuildTaskPacketAsync(selected.VaultRoot, descriptor, maxTotalChars, cancellationToken);
+            // Only an explicit receipt for retained model context permits omission.
+            // Compilation and integrity verification still run on every request.
+            var unchanged = session.StartupCompletedAtUtc is not null && session.InvalidatedAtUtc is null &&
+                session.StartupTaskFingerprint == descriptor.Fingerprint() &&
+                session.LastContextBodySha256 == context.Packet.BodySha256 &&
+                string.Equals(knownContextSha256, context.Packet.BodySha256, StringComparison.OrdinalIgnoreCase);
             var tokens = 0;
             foreach (var file in session.Files)
             {
@@ -133,16 +142,25 @@ public static class AgentSessions
             }
             foreach (var file in context.Files)
             {
-                tokens += TrackRead(session, file.RelativePath, file.RawSha256, file.Content);
+                if (unchanged)
+                {
+                    var retained = session.Files.SingleOrDefault(item => item.RelativePath == file.RelativePath);
+                    if (retained is null) { throw new AgentSessionException("AGENT_CONTEXT_RECEIPT_INVALID", "Retained context basis is incomplete. Retry without --known-context-sha256."); }
+                    retained.RawSha256 = file.RawSha256;
+                    retained.InBasis = true;
+                }
+                else { tokens += TrackRead(session, file.RelativePath, file.RawSha256, file.Content); }
             }
             session.StartupCompletedAtUtc = DateTimeOffset.UtcNow;
             session.StartupTaskFingerprint = descriptor.Fingerprint();
+            session.LastContextBodySha256 = context.Packet.BodySha256;
             session.StartupOperation = operation == TaskOperation.MaintainVault ? "maintain-vault" : operation.ToString().ToLowerInvariant();
             session.StartupSubjects = descriptor.Subjects.ToList();
             session.StartupPaths = descriptor.Paths.ToList();
             session.InvalidatedAtUtc = null;
             session.LastSeenAtUtc = DateTimeOffset.UtcNow;
-            return new AgentContextResult(context.Packet, descriptor.Fingerprint(), AgentSessionDocument.BasisHash(session), AgentSessionDocument.BasisFileCount(session), tokens, true);
+            var packet = unchanged ? context.Packet with { Body = string.Empty } : context.Packet;
+            return new AgentContextResult(packet, descriptor.Fingerprint(), AgentSessionDocument.BasisHash(session), AgentSessionDocument.BasisFileCount(session), tokens, true, unchanged ? "unchanged" : "full");
         }, cancellationToken);
     }
 
@@ -466,7 +484,7 @@ public static class AgentSessions
         var inspection = await VaultInspector.InspectIdentityAsync(configuredRoot, cancellationToken);
         if (!string.Equals(inspection.VaultId, registryId.GetString(), StringComparison.OrdinalIgnoreCase) || !string.Equals(inspection.ContentIntegrityCanonicalSha256, registryHash.GetString(), StringComparison.OrdinalIgnoreCase))
         {
-            throw new AgentSessionException("VAULT_REGISTRY_INTEGRITY_MISMATCH", "Selected private-vault identity or protected-content anchor did not verify.");
+            throw new AgentSessionException("VAULT_REGISTRY_INTEGRITY_MISMATCH", "Rule Vault found a mismatch between its saved protected-file fingerprint and the files on disk. Run the verified Rule Vault installer to archive the old state and repair or explicitly accept the current files; do not bypass this check.");
         }
 
         return new SelectedVault(configuredRoot, configRoot);
@@ -544,6 +562,10 @@ public static class AgentSessions
         if (writeRequired && session.StartupOperation is not ("edit" or "release" or "maintain-vault"))
         {
             throw new AgentSessionException("AGENT_CONTEXT_OPERATION_REQUIRED", "The loaded context does not cover writes. Call agent context with operation edit, release, or maintain-vault before continuing.");
+        }
+        if (writeRequired && !session.StartupPaths.Any(path => path.StartsWith(".agents/", StringComparison.Ordinal)))
+        {
+            RequireAnySubject(session, ["memory", "daily", "continuity", "handoff", "project", "repository", "git"], "vault or shared-memory writes (use memory for general vault authoring)");
         }
     }
 
@@ -674,6 +696,7 @@ public static class AgentSessions
         public DateTimeOffset? InvalidatedAtUtc { get; set; }
         public DateTimeOffset? StartupCompletedAtUtc { get; set; }
         public string? StartupTaskFingerprint { get; set; }
+        public string? LastContextBodySha256 { get; set; }
         public string? StartupOperation { get; set; }
         public List<string> StartupSubjects { get; set; } = [];
         public List<string> StartupPaths { get; set; } = [];

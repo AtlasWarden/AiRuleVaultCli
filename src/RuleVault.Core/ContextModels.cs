@@ -188,7 +188,7 @@ public sealed record ContextSegment(
     string FileId,
     string RelativePath,
     bool Mandatory,
-    string Body,
+    [property: System.Text.Json.Serialization.JsonIgnore] string Body,
     string CanonicalSha256);
 
 public sealed record ContextPacket(

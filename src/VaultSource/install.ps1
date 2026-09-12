@@ -15,6 +15,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:ChangesApproved = $false
+$script:IntegrityRepairOutcome = 'not-attempted'
 
 function Write-InstallerHeader([string] $Status = '', [int] $Percent = 0) {
     Clear-Host
@@ -67,6 +69,33 @@ function Show-PlanBlocked([object] $Result, [int] $ExitCode) {
     Write-Host '  Your existing vault and agent settings were not changed.' -ForegroundColor Gray
 }
 
+function Show-PlainPlan([object] $Plan, [string] $Operation, [switch] $Repair) {
+    Write-InstallerHeader 'Ready for your approval' 80
+    if ($Repair) {
+        Write-Host '  Rule Vault will save copies of the mismatched system files, fix them,' -ForegroundColor White
+        Write-Host '  and then finish updating the vault.' -ForegroundColor White
+        Write-Host '  Your rules, context, skills, roles, projects, and daily notes will be kept.' -ForegroundColor Gray
+    } elseif ($Operation -eq 'Install a new vault') {
+        Write-Host '  Rule Vault is ready to create the vault and install its command-line tool.' -ForegroundColor White
+    } else {
+        Write-Host '  Rule Vault is ready to update its managed files and command-line tool.' -ForegroundColor White
+        Write-Host '  Your rules, context, skills, roles, projects, and daily notes will be kept.' -ForegroundColor Gray
+    }
+
+    $changeCount = @($Plan.operations).Count
+    Write-Host "  The plan contains $changeCount file and setup change(s)." -ForegroundColor Gray
+    Write-Host "  Plan: $($Plan.plan_path)" -ForegroundColor DarkGray
+    Write-Host ''
+}
+
+function Confirm-PlanChanges {
+    if ($NonInteractive) { return [bool]$Apply }
+    if ($script:ChangesApproved) { return $true }
+    if ((Read-Choice 'Are these changes okay? Y/N' @('Y', 'N') 'Y') -ne 'Y') { return $false }
+    $script:ChangesApproved = $true
+    return $true
+}
+
 function Invoke-IntegrityRepair([string] $CliPath, [string] $PackageRoot, [string] $VaultRoot, [string] $ConfigRoot, [string] $VaultId, [string] $Strategy, [object] $Failure) {
     $script:IntegrityRepairOutcome = 'blocked'
     if ([string]::IsNullOrWhiteSpace($Strategy)) {
@@ -111,24 +140,20 @@ function Invoke-IntegrityRepair([string] $CliPath, [string] $PackageRoot, [strin
         return $false
     }
 
-    if (-not $Apply) {
-        Write-InstallerHeader 'Safe repair plan ready' 75
-        Write-Host '  No files were changed. Review the repair plan, then rerun the installer with -Apply.' -ForegroundColor Yellow
-        Write-Host "  Plan: $repairPlanPath" -ForegroundColor Cyan
-        $script:IntegrityRepairOutcome = 'planned'
+    $repairPlan = Get-Content -LiteralPath $repairPlanPath -Raw | ConvertFrom-Json
+    $repairPlan | Add-Member -NotePropertyName plan_path -NotePropertyValue $repairPlanPath -Force
+    Show-PlainPlan $repairPlan 'Update the existing vault' -Repair
+    if (-not (Confirm-PlanChanges)) {
+        if ($NonInteractive) {
+            Write-Host '  No files were changed. Run again with -Apply to approve this plan.' -ForegroundColor Yellow
+            $script:IntegrityRepairOutcome = 'planned'
+        } else {
+            Write-Host '  Okay. Nothing was changed.' -ForegroundColor Gray
+            $script:IntegrityRepairOutcome = 'cancelled'
+        }
         return $false
     }
 
-    if (-not $NonInteractive) {
-        Write-InstallerHeader 'Safe repair is ready' 75
-        Write-Host '  Rule Vault will save the old file list and any changed system files in an archive first.' -ForegroundColor Gray
-        Write-Host '  Your ordinary rules, context, skills, roles, projects, and daily notes will be kept.' -ForegroundColor Gray
-        Write-Host "  Plan: $repairPlanPath" -ForegroundColor Cyan
-        Write-Host ''
-        if ((Read-Choice 'Use this repair and continue the update? Y/N' @('Y', 'N') 'Y') -ne 'Y') { $script:IntegrityRepairOutcome = 'cancelled'; return $false }
-    }
-
-    $repairPlan = Get-Content -LiteralPath $repairPlanPath -Raw | ConvertFrom-Json
     $decision = @($repairPlan.required_decisions)[0]
     $repairApply = & $CliPath plan apply $repairPlanPath --approve $repairPlan.plan_sha256 --accept-decision $decision --format json
     if ($LASTEXITCODE -ne 0 -or (($repairApply | Out-String | ConvertFrom-Json).code) -ne 'OK') {
@@ -138,6 +163,39 @@ function Invoke-IntegrityRepair([string] $CliPath, [string] $PackageRoot, [strin
     Update-InstallerProgress 76 'Mismatch fixed; continuing the update'
     $script:IntegrityRepairOutcome = 'applied'
     return $true
+}
+
+function Confirm-InstalledVaultReady([string] $CliPath, [string] $PackageRoot, [string] $VaultRoot, [string] $ConfigRoot, [string] $VaultId, [string] $GuideSha256, [string] $Strategy) {
+    $verificationPlanPath = Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'RuleVault') ("post-install-check-$VaultId.json")
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        Update-InstallerProgress 93 'Checking that agents can use the updated vault'
+        $verificationResult = & $CliPath update plan --vault-root $VaultRoot --config-root $ConfigRoot --vault-id $VaultId --package-root $PackageRoot --guide-sha256 $GuideSha256 --output $verificationPlanPath --format json
+        $verificationExitCode = $LASTEXITCODE
+        $verification = $null
+        try { $verification = $verificationResult | Out-String | ConvertFrom-Json } catch { }
+
+        if ($verificationExitCode -eq 0 -and $verification -and $verification.code -eq 'OK') {
+            $remainingOperations = @($verification.data.plan.operations)
+            if ($remainingOperations.Count -ne 0) {
+                throw 'The installer finished its plan, but another update is still required. No success was reported; rerun the installer to review the new plan.'
+            }
+            return
+        }
+
+        $repairable = $verification -and $verification.code -in @(
+            'INTEGRITY_ANCHOR_MISMATCH',
+            'INTEGRITY_HASH_MISMATCH',
+            'VAULT_REGISTRY_INTEGRITY_MISMATCH'
+        )
+        if ($attempt -eq 0 -and $repairable -and (Invoke-IntegrityRepair $CliPath $PackageRoot $VaultRoot $ConfigRoot $VaultId $Strategy $verification)) {
+            continue
+        }
+
+        Show-PlanBlocked $verificationResult $verificationExitCode
+        throw 'The updated vault did not pass its final registry and protected-file check. The CLI was not replaced and success was not reported.'
+    }
+
+    throw 'The updated vault could not be made ready for agent use.'
 }
 
 function Read-Choice([string] $Prompt, [string[]] $Allowed, [string] $Default = '') {
@@ -459,17 +517,6 @@ if ($existingVault) {
     $operation = 'Update the existing vault'
 }
 
-if (-not $NonInteractive) {
-    Update-InstallerProgress 65 'Waiting for your confirmation'
-    Write-Host "  ⚙  Task Action: $operation" -ForegroundColor White
-    if ($existingVault) { Write-Host '  Your existing files will be preserved unless a reviewed conversion is safe.' -ForegroundColor DarkGray }
-    Write-Host "     CLI:    $(Join-Path $configRootFull 'cli\rv.exe')" -ForegroundColor Gray
-    Write-Host "     Vault:  $vaultRootFull" -ForegroundColor Cyan
-    Write-Host "     Plan:   $planPathFull" -ForegroundColor Gray
-    Write-Host ''
-    if ((Read-Choice '  Create the reviewable plan? Y/N' @('Y', 'N') 'Y') -ne 'Y') { Complete-InstallerProgress; Write-Host '  No changes were made.' -ForegroundColor Gray; exit 0 }
-}
-
 $planDirectory = Split-Path -Parent $planPathFull
 if (-not (Test-Path -LiteralPath $planDirectory)) { New-Item -ItemType Directory -Path $planDirectory -Force | Out-Null }
 
@@ -496,26 +543,19 @@ if ($LASTEXITCODE -ne 0) {
 }
 if ((($planResult | Out-String | ConvertFrom-Json).code) -ne 'OK') { throw 'Plan creation returned an unexpected result.' }
 
-Write-Host ''
-Update-InstallerProgress 80 'Plan ready for review'
-Write-Host '  ✔ Plan created successfully.' -ForegroundColor Green
-Write-Host "  📌 Review: $planPathFull" -ForegroundColor Cyan
-
-if (-not $Apply) {
-    Complete-InstallerProgress
-    Write-Host "----------------------------------------------------" -ForegroundColor DarkGray
-    Write-Host '  No vault or configuration files were changed.' -ForegroundColor Gray
-    Write-Host '  Rerun with -Apply after reviewing the plan.' -ForegroundColor Yellow
-    exit 0
-}
-
-if (-not $NonInteractive -and (Read-Choice '  Apply this exact reviewed plan now? Y/N' @('Y', 'N') 'Y') -ne 'Y') {
-    Complete-InstallerProgress
-    Write-Host '  Plan retained; no vault or configuration files were changed.' -ForegroundColor Gray
-    exit 0
-}
-
 $plan = Get-Content -LiteralPath $planPathFull -Raw | ConvertFrom-Json
+$plan | Add-Member -NotePropertyName plan_path -NotePropertyValue $planPathFull -Force
+Show-PlainPlan $plan $operation
+if (-not (Confirm-PlanChanges)) {
+    Complete-InstallerProgress
+    if ($NonInteractive) {
+        Write-Host '  No files were changed. Run again with -Apply to approve this plan.' -ForegroundColor Yellow
+    } else {
+        Write-Host '  Okay. Nothing was changed.' -ForegroundColor Gray
+    }
+    exit 0
+}
+
 Update-InstallerProgress 90 'Applying verified files to the selected locations'
 $applyResult = & $artifactPath plan apply $planPathFull --approve $plan.plan_sha256 --format json
 if ($LASTEXITCODE -ne 0) {
@@ -527,6 +567,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if ((($applyResult | Out-String | ConvertFrom-Json).code) -eq 'OK') {
+    Confirm-InstalledVaultReady $artifactPath $packageRootFull $vaultRootFull $configRootFull $VaultId $guideSha256 $IntegrityRepairStrategy
     Update-InstallerProgress 95 'Installing the verified local CLI'
     try { $cliInstall = Install-TrustedCli $artifactPath $artifact.raw_sha256 $configRootFull $guideSha256 }
     catch {

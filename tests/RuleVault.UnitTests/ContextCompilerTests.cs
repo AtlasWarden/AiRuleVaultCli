@@ -137,6 +137,28 @@ public sealed class ContextCompilerTests
         Assert.Equal((int)Math.Ceiling(packet.Characters / 4d), packet.ApproximateTokens);
     }
 
+    [Fact]
+    public void RequiredSubjectDependenciesCannotBeDroppedByZeroOptionalBudget()
+    {
+        var safety = Route("safety", RouteScope.Subject, LoadPolicy.Always, ["memory"]);
+        var daily = Route("daily", RouteScope.Subject, LoadPolicy.Always, ["daily"]) with { Requires = ["safety"] };
+        var catalog = ContextCatalog.Compile([Document(safety, "Required safety text"), Document(daily)]);
+        var packet = catalog.Render(TaskDescriptor.Create("p", TaskOperation.Edit, ["daily"], optionalBudgetChars: 0)).Packet!;
+        Assert.Contains(packet.Segments, segment => segment.RouteId == "safety" && segment.Mandatory);
+        Assert.Contains("Required safety text", packet.Body, StringComparison.Ordinal);
+        Assert.True(catalog.Render(TaskDescriptor.Create("p", TaskOperation.Edit, ["daily"]), maxTotalChars: 1).IsBlocked);
+    }
+
+    [Fact]
+    public void ContextJsonCarriesOneBodyAndSegmentProvenance()
+    {
+        var packet = ContextCatalog.Compile([Document(Route("one", RouteScope.Global, LoadPolicy.Always), "UNIQUE_RULE_TEXT")])
+            .Render(TaskDescriptor.Create("p", TaskOperation.Read)).Packet!;
+        var serialized = System.Text.Json.JsonSerializer.Serialize(packet);
+        Assert.Equal(2, serialized.Split("UNIQUE_RULE_TEXT", StringSplitOptions.None).Length);
+        Assert.Contains("UNIQUE_RULE_TEXT", packet.Segments[0].Body, StringComparison.Ordinal);
+    }
+
     private static IReadOnlyList<ContextDocument> FixtureDocuments() =>
     [
         Document(Route("global-always", RouteScope.Global, LoadPolicy.Always), "global body"),

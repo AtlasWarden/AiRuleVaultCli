@@ -1,8 +1,9 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string] $InstallationSource = "..\src\VaultSource",
     [string] $OutputDirectory = "..\InstallerPackage",
-    [string] $ArchivePath = "..\artifacts\RuleVault-0.1.0-dev-win-x64.zip"
+    [string] $ArchivePath = "..\artifacts\RuleVault-0.1.0-dev-win-x64.zip",
+    [switch] $RunTests
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,13 +34,11 @@ if ([string]::Equals($sourceRoot, $outputRoot, [StringComparison]::OrdinalIgnore
     throw 'Package output cannot be the installation source.'
 }
 
-if (Test-Path -Path $outputRoot -PathType Container) {
-    Write-Host " 🧹  Cleaning existing output directory..." -ForegroundColor DarkGray
-    Remove-Item -LiteralPath $outputRoot -Recurse -Force
-}
-
-# The progress bar continues inside build.ps1 here
-$CliArtifactDirectory = & "$PSScriptRoot/build.ps1" -Target "publish"
+# Package creation is fast by default. Release validation remains available when
+# explicitly requested instead of making every local package rerun the full suite.
+$buildArguments = @{ Target = 'publish' }
+if (-not $RunTests) { $buildArguments.SkipTests = $true }
+$CliArtifactDirectory = & "$PSScriptRoot/build.ps1" @buildArguments
 
 if ($null -eq $CliArtifactDirectory) {
     Write-Progress -Activity "Building Installer Package" -Completed
@@ -50,16 +49,16 @@ if ($null -eq $CliArtifactDirectory) {
 Write-Progress -Activity "Building Installer Package" -Status "Staging compilation artifacts..." -PercentComplete 85
 
 $artifactRoot = [IO.Path]::GetFullPath($CliArtifactDirectory)
-$stalePlan = Join-Path $outputRoot 'install.plan.json'
-if (Test-Path -LiteralPath $stalePlan -PathType Leaf) {
-    Remove-Item -LiteralPath $stalePlan -Force
-}
-
 $executable = Join-Path $artifactRoot 'rv.exe'
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
     Write-Progress -Activity "Building Installer Package" -Completed
     Write-Host " ❌  [ERROR] Compiled executable 'rv.exe' was missing from $artifactRoot" -ForegroundColor Red
     exit 1
+}
+
+if (Test-Path -Path $outputRoot -PathType Container) {
+    Write-Host " 🧹  Cleaning existing output directory..." -ForegroundColor DarkGray
+    Remove-Item -LiteralPath $outputRoot -Recurse -Force
 }
 
 # Prepare Staging Layout
@@ -73,6 +72,8 @@ $sourcePayload = Join-Path $sourceRoot 'runtime-payload'
 if (Test-Path -Path $sourcePayload -PathType Container) {
     Get-ChildItem -LiteralPath $sourcePayload -Force |
         Copy-Item -Destination (Join-Path $outputRoot 'runtime-payload') -Recurse -Force
+} else {
+    throw "Required runtime payload is missing: $sourcePayload"
 }
 
 $requiredFiles = @('package.json', 'guide.md', 'migrations.json', 'install.ps1', 'install.sh')
@@ -81,8 +82,8 @@ foreach ($file in $requiredFiles) {
     if (Test-Path -LiteralPath $targetFile -PathType Leaf) {
         Copy-Item -LiteralPath $targetFile -Destination (Join-Path $outputRoot $file) -Force
         Write-Host "     ✔ Linked target asset: $file" -ForegroundColor DarkGreen
-    }else{
-        Write-Host "     ⚠ Missing deployment asset fallback: $file" -ForegroundColor Yellow
+    } else {
+        throw "Required deployment asset is missing: $targetFile"
     }
 }
 
@@ -93,7 +94,7 @@ $packageFiles = @(Get-ChildItem -LiteralPath $outputRoot -Recurse -File | Where-
     $_.FullName -ne $artifactPath -and $_.Name -ne 'artifacts.json'
 } | Sort-Object FullName | ForEach-Object {
     [ordered]@{
-        relative_path = [IO.Path]::GetRelativePath($outputRoot, $_.FullName).Replace('\', '/')
+        relative_path = $_.FullName.Substring($outputRoot.TrimEnd([IO.Path]::DirectorySeparatorChar).Length).TrimStart([IO.Path]::DirectorySeparatorChar).Replace('\', '/')
         raw_sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
         size = $_.Length
     }

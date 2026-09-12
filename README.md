@@ -30,7 +30,7 @@ Commands support `--format text`, `--format json`, or `--format table`, plus
 
 ## Build and test
 
-Requires the .NET SDK selected by `global.json` and PowerShell 7.
+Requires the .NET SDK selected by `global.json` and Windows PowerShell 5.1 or later.
 
 ```powershell
 .\build\build.ps1 -Target verify

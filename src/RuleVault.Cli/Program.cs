@@ -16,7 +16,10 @@ internal sealed record CliEnvelope(
     string Summary,
     object? Data,
     IReadOnlyList<CliDiagnostic> Diagnostics,
-    IReadOnlyList<string> NextActions);
+    IReadOnlyList<string> NextActions,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] OutputTokenUsage? TokenUsage = null);
+
+internal sealed record OutputTokenUsage(string Encoding, int SerializedTokensExcludingUsage, string Scope);
 
 internal sealed record CliDiagnostic(string Code, string Severity, string Message);
 internal sealed record UnavailableOperation(string Command, string Reason, string Alternative);
@@ -27,6 +30,8 @@ internal sealed class CliInvocation
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         WriteIndented = true,
+        // These are terminal/data-file responses, never HTML or executable script.
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
         UnmappedMemberHandling = System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow,
         Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) }
     };
@@ -678,8 +683,11 @@ internal sealed class CliInvocation
                 VaultInspector.ParseAudience(Option("audience") ?? "private"),
                 BooleanOption("include-history", false),
                 IntegerOption("optional-budget-chars", 8000, minimum: 0),
-                NullableIntegerOption("max-total-chars", minimum: 0));
-            return Write("agent context", "ok", "OK", "Loaded every applicable mandatory rule and the task-scoped optional context. Agent startup is complete for this session.", result, 0, json);
+                NullableIntegerOption("max-total-chars", minimum: 0),
+                knownContextSha256: Option("known-context-sha256"));
+            return Write("agent context", "ok", "OK", result.Delivery == "unchanged"
+                ? "Context revalidated and unchanged. Continue using the retained packet; its body is omitted."
+                : "Loaded every applicable mandatory rule and the task-scoped optional context. Agent startup is complete for this session.", result, 0, json);
         }
         catch (AgentSessionException exception) { return Write("agent context", "blocked", exception.Code, exception.Message, null, 4, json); }
         catch (ContextCatalogException exception) { return Write("agent context", "blocked", exception.Code, exception.Message, null, 4, json); }
@@ -1050,6 +1058,11 @@ internal sealed class CliInvocation
         {
             var envelope = new CliEnvelope(1, command, status, code, summary, data, [], status == "needs-input" ? ["Review the required input and rerun."] : []);
             rendered = JsonSerializer.Serialize(envelope, JsonOptions) + Environment.NewLine;
+            if (data is AgentContextResult or AgentReadResult)
+            {
+                envelope = envelope with { TokenUsage = new OutputTokenUsage("cl100k_base", AgentSessions.CountOutputTokens(rendered), "Serialized response excluding token_usage; read_tokens counts source content. Neither measures provider billing or model reasoning.") };
+                rendered = JsonSerializer.Serialize(envelope, JsonOptions) + Environment.NewLine;
+            }
         }
         else if (string.Equals(Option("format"), "table", StringComparison.OrdinalIgnoreCase))
         {
@@ -1058,7 +1071,12 @@ internal sealed class CliInvocation
         else
         {
             rendered = summary + Environment.NewLine;
-            if (data is not null && Has("verbose"))
+            if (data is AgentContextResult context && !Has("verbose"))
+            {
+                rendered += $"Context SHA-256: {context.Packet.BodySha256}; delivery: {context.Delivery}" + Environment.NewLine;
+                rendered += context.Packet.Body + Environment.NewLine;
+            }
+            else if (data is not null && Has("verbose"))
             {
                 rendered += JsonSerializer.Serialize(data, JsonOptions) + Environment.NewLine;
             }
@@ -1446,7 +1464,8 @@ internal sealed class CliInvocation
             new { name = "agent status", purpose = "Report compact session currency and token totals; use --detail files for per-file token/access and reader details.", freshness = "Automatically removes sessions inactive for more than three days." },
             new { name = "agent clear", purpose = "Clear one session or all session records.", freshness = "Requires explicit session id or --all true." }
         },
-        tokenizer = new { encoding = "cl100k_base", scope = "read and write content", precision = "model-agnostic approximation; provider billing remains authoritative" },
+        context_delivery = new { body = "Packet body appears once; segments contain provenance only. Text format also delivers the complete body.", reuse = "Pass --known-context-sha256 with the last packet body_sha256 ONLY while that complete packet is retained in your current context. Omit after compaction, restart, lost context, or registration. An unchanged response has an empty body and retains the original packet hash and size metadata; all trust checks still run. Changed context is sent in full.", authoring = "Before vault or shared-memory writes, request subject memory or the applicable daily/continuity/handoff/project/repository/git scope; .agents paths also select repository procedures. Ordinary source-code edits do not need vault-authoring procedures.", daily = "Ordinary context omits only the trailing Sessions history of recognized daily notes; current handoff and preceding sections remain. Use a daily subject or --include-history true for the full active note." },
+        tokenizer = new { encoding = "cl100k_base", scope = "read_tokens/write_tokens count source content; token_usage.serialized_tokens_excluding_usage measures response text including JSON overhead, excluding token_usage itself", precision = "local encoding estimate; excludes agent reasoning and conversation replay; provider billing remains authoritative" },
         repository_agents = new { status = "available through opaque agent commands", safety = "Git object/path gate, strict parsing, and applicable schema validation precede verified authority; returned content remains data unless content_handling reports verified-current-branch" },
         authoring_scope = new { private_vault = "managed Markdown for rules, context, roles, skills, indexes, project state, daily notes, conflict records, and security dispositions", shared_repository = "managed .agents Markdown on the registered Git workspace", protected_system = "new indexes, load_policy always files, and integrity protected files are enrolled atomically; existing protected files remain protected" },
         unavailable_operations = UnavailableOperations.Select(item => new { name = item.Command, reason = item.Reason, alternative = item.Alternative }).Cast<object>().Append(

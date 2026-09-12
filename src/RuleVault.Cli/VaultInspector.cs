@@ -240,7 +240,10 @@ internal static class VaultInspector
             var metadata = ManagedDocumentMetadataValidator.Parse(path, read.Content, requireCompleteSchema: true);
             var routeId = "project-" + path[basePath.Length..].Trim('/').Replace('/', '-').Replace('.', '-');
             var route = new ContextRoute(routeId, metadata.FileId, path, metadata.Kind, RouteScope.Project, LoadPolicy.Always, [], AllOperations(), [], 100, ["vault-discovery-and-integrity"], ContextAudience.Private);
-            documents.Add(new ContextDocument(route, read.Content, CanonicalHash.Text(read.Content)));
+            var body = path == activePath
+                ? DailyContextProjection.Render(read.Content, descriptor.IncludeHistory || descriptor.Subjects.Intersect(["daily", "continuity", "handoff"], StringComparer.Ordinal).Any())
+                : read.Content;
+            documents.Add(new ContextDocument(route, body, CanonicalHash.Text(read.Content)));
             contextFiles[path] = new VaultContextFile(path, read.Content, read.RawSha256, true);
         }
 

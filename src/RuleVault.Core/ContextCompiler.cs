@@ -135,8 +135,21 @@ public sealed class ContextCatalog
             }
         }
 
+        // A required dependency cannot become optional merely because its own subject
+        // was not requested. Propagate mandatory status through the whole closure.
+        var mandatory = direct.Values.Where(document => IsMandatory(document.Route, descriptor))
+            .Select(document => document.Route.RouteId).ToHashSet(StringComparer.Ordinal);
+        var required = new Queue<string>(mandatory);
+        while (required.TryDequeue(out var id))
+        {
+            foreach (var dependency in _documents[id].Route.Requires)
+            {
+                if (mandatory.Add(dependency)) { required.Enqueue(dependency); }
+            }
+        }
+
         return direct.Values
-            .Select(document => new SelectedDocument(document, IsMandatory(document.Route, descriptor)))
+            .Select(document => new SelectedDocument(document, mandatory.Contains(document.Route.RouteId)))
             .OrderBy(item => SectionOrder(item.Document.Route, item.Mandatory))
             .ThenByDescending(item => item.Document.Route.OptionalPriority)
             .ThenBy(item => item.Document.Route.RouteId, StringComparer.Ordinal)

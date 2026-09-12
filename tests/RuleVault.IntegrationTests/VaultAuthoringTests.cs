@@ -75,10 +75,21 @@ public sealed class VaultAuthoringTests
         Assert.Contains(packet.GetProperty("segments").EnumerateArray(), segment => segment.GetProperty("route_id").GetString() == "root-index");
         Assert.Contains(packet.GetProperty("segments").EnumerateArray(), segment => segment.GetProperty("route_id").GetString() == "vault-discovery-and-integrity");
         Assert.Contains("# Rule Vault Index", packet.GetProperty("body").GetString(), StringComparison.Ordinal);
+        Assert.All(packet.GetProperty("segments").EnumerateArray(), segment => Assert.False(segment.TryGetProperty("body", out _)));
+        Assert.True(context.RootElement.GetProperty("token_usage").GetProperty("serialized_tokens_excluding_usage").GetInt32() > 0);
+        var receipt = packet.GetProperty("body_sha256").GetString()!;
+        using var reused = await Cli("agent", "context", "--config-root", fixture.Config, "--session-id", "startup-session", "--operation", "read", "--known-context-sha256", receipt);
+        Assert.Equal("unchanged", reused.RootElement.GetProperty("data").GetProperty("delivery").GetString());
+        Assert.Equal("", reused.RootElement.GetProperty("data").GetProperty("packet").GetProperty("body").GetString());
+        Assert.Equal(0, reused.RootElement.GetProperty("data").GetProperty("read_tokens").GetInt32());
+        using var noReceipt = await Cli("agent", "context", "--config-root", fixture.Config, "--session-id", "startup-session", "--operation", "read");
+        Assert.Equal("full", noReceipt.RootElement.GetProperty("data").GetProperty("delivery").GetString());
         var writeContent = Fixture.Managed("Blocked Write", "global", "context", "# Blocked Write\n");
         using var writeBlocked = await CliExpectExit(4, "agent", "write", "--config-root", fixture.Config, "--session-id", "startup-session", "--path", "global/blocked.md", "--content", writeContent);
         Assert.Equal("AGENT_CONTEXT_OPERATION_REQUIRED", writeBlocked.RootElement.GetProperty("code").GetString());
         using var editContext = await Cli("agent", "context", "--config-root", fixture.Config, "--session-id", "startup-session", "--operation", "edit");
+        using var memoryScopeBlocked = await CliExpectExit(4, "agent", "write", "--config-root", fixture.Config, "--session-id", "startup-session", "--path", "global/blocked.md", "--content", writeContent);
+        Assert.Equal("AGENT_CONTEXT_SCOPE_REQUIRED", memoryScopeBlocked.RootElement.GetProperty("code").GetString());
         using var scopeBlocked = await CliExpectExit(4, "agent", "project", "create", "--config-root", fixture.Config, "--session-id", "startup-session", "--slug", "scope-project", "--title", "Scope Project");
         Assert.Equal("AGENT_CONTEXT_SCOPE_REQUIRED", scopeBlocked.RootElement.GetProperty("code").GetString());
 
@@ -86,6 +97,13 @@ public sealed class VaultAuthoringTests
         Assert.True(repeatedRegistration.RootElement.GetProperty("data").GetProperty("startup_required").GetBoolean());
         using var blockedAgain = await CliExpectExit(4, "agent", "read", "--config-root", fixture.Config, "--session-id", "startup-session", "--path", "index.md");
         Assert.Equal("AGENT_STARTUP_REQUIRED", blockedAgain.RootElement.GetProperty("code").GetString());
+        using var restart = await Cli("agent", "context", "--config-root", fixture.Config, "--session-id", "startup-session", "--operation", "read", "--known-context-sha256", receipt);
+        Assert.Equal("full", restart.RootElement.GetProperty("data").GetProperty("delivery").GetString());
+        using var changedTask = await Cli("agent", "context", "--config-root", fixture.Config, "--session-id", "startup-session", "--operation", "edit", "--known-context-sha256", receipt);
+        Assert.Equal("full", changedTask.RootElement.GetProperty("data").GetProperty("delivery").GetString());
+        await File.AppendAllTextAsync(Path.Combine(fixture.Vault, "index.md"), "\nUnverified alteration.\n", TestContext.Current.CancellationToken);
+        using var tampered = await CliExpectExit(4, "agent", "context", "--config-root", fixture.Config, "--session-id", "startup-session", "--operation", "edit", "--known-context-sha256", changedTask.RootElement.GetProperty("data").GetProperty("packet").GetProperty("body_sha256").GetString()!);
+        Assert.Equal("blocked", tampered.RootElement.GetProperty("status").GetString());
     }
 
     [Fact]
@@ -388,7 +406,7 @@ public sealed class VaultAuthoringTests
 
     private static Task<JsonDocument> AgentContext(string configRoot, string sessionId, string operation, string? subjects = null) =>
         subjects is null
-            ? Cli("agent", "context", "--config-root", configRoot, "--session-id", sessionId, "--operation", operation)
+            ? Cli("agent", "context", "--config-root", configRoot, "--session-id", sessionId, "--operation", operation, "--subjects", "memory")
             : Cli("agent", "context", "--config-root", configRoot, "--session-id", sessionId, "--operation", operation, "--subjects", subjects);
 
     private static string RepositoryManaged(string fileId, string title, string kind, string body, string extra = "") =>
