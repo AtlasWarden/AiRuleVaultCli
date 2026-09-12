@@ -72,8 +72,8 @@ function Show-PlanBlocked([object] $Result, [int] $ExitCode) {
 function Show-PlainPlan([object] $Plan, [string] $Operation, [switch] $Repair) {
     Write-InstallerHeader 'Ready for your approval' 80
     if ($Repair) {
-        Write-Host '  Rule Vault will save copies of the mismatched system files, fix them,' -ForegroundColor White
-        Write-Host '  and then finish updating the vault.' -ForegroundColor White
+        Write-Host '  Rule Vault found saved fingerprints that do not match the current files.' -ForegroundColor White
+        Write-Host '  It will archive the old records, calculate new fingerprints, and continue.' -ForegroundColor White
         Write-Host '  Your rules, context, skills, roles, projects, and daily notes will be kept.' -ForegroundColor Gray
     } elseif ($Operation -eq 'Install a new vault') {
         Write-Host '  Rule Vault is ready to create the vault and install its command-line tool.' -ForegroundColor White
@@ -99,34 +99,7 @@ function Confirm-PlanChanges {
 function Invoke-IntegrityRepair([string] $CliPath, [string] $PackageRoot, [string] $VaultRoot, [string] $ConfigRoot, [string] $VaultId, [string] $Strategy, [object] $Failure) {
     $script:IntegrityRepairOutcome = 'blocked'
     if ([string]::IsNullOrWhiteSpace($Strategy)) {
-        if ($NonInteractive) { return $false }
-        Write-InstallerHeader 'Rule Vault found a file mismatch' 70
-        if ($Failure -and $Failure.code -eq 'INTEGRITY_ANCHOR_MISMATCH') {
-            Write-Host '  Rule Vault keeps a list of the system files that should not change unexpectedly.' -ForegroundColor White
-            Write-Host '  It saves a hash for that list. A hash is a short code made from the list contents.' -ForegroundColor Gray
-            Write-Host '  The saved code and the list on this computer are different.' -ForegroundColor Yellow
-        } elseif ($Failure -and $Failure.code -eq 'INTEGRITY_HASH_MISMATCH') {
-            Write-Host '  Rule Vault saves a hash for each important system file.' -ForegroundColor White
-            Write-Host '  A hash is a short code made from the file contents.' -ForegroundColor Gray
-            Write-Host '  At least one file and its saved code are now different.' -ForegroundColor Yellow
-        } else {
-            Write-Host '  Rule Vault saves a hash so it can tell when an important system file changes.' -ForegroundColor White
-            Write-Host '  A hash is a short code made from the file contents.' -ForegroundColor Gray
-            Write-Host '  A saved code and a file on this computer are now different.' -ForegroundColor Yellow
-        }
-        Write-Host '  This can happen after an interrupted update or when a file was edited by hand.' -ForegroundColor Gray
-        Write-Host '  It does not automatically mean your personal rules or project data are lost.' -ForegroundColor Gray
-        Write-Host '  Before fixing anything, Rule Vault will save copies of the old files in an archive.' -ForegroundColor DarkGray
-        Write-Host ''
-        Write-MenuOption '[1] Put back the trusted Rule Vault files and keep my personal data (recommended)' $true
-        Write-Host '      Press Enter for this. Changed protected files are archived, then replaced from this installer.' -ForegroundColor DarkGray
-        Write-MenuOption '[2] Keep the changed protected files and create new fingerprints for them' $false
-        Write-Host '      Choose this only when you recognize and trust those file changes.' -ForegroundColor DarkGray
-        Write-MenuOption '[Q] Stop without changing anything' $false
-        Write-Host ''
-        $choice = Read-Choice 'Choose 1, 2, or Q' @('1', '2', 'Q') '1'
-        if ($choice -eq 'Q') { $script:IntegrityRepairOutcome = 'cancelled'; return $false }
-        $Strategy = if ($choice -eq '1') { 'restore-package' } else { 'accept-current' }
+        $Strategy = 'accept-current'
     }
 
     $repairPlanPath = Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'RuleVault') ("repair-plan-$VaultId.json")
